@@ -1,0 +1,539 @@
+{
+  "links": {
+    "personal": {
+      "explain": "http://127.0.0.1:21101"
+    },
+    "explain": {
+      "personal": "http://127.0.0.1:21103"
+    }
+  },
+  "cases": [
+    {
+      "case": "todo draft from Explain",
+      "target": "personal",
+      "hash": "#/tasks?draft=%E8%A4%87%E7%BF%92+%E5%82%85%E7%AB%8B%E8%91%89&from=explain&back=%23%2Fnote%2Fabc",
+      "expect": {
+        "from": "explain",
+        "text": "\u8907\u7fd2 \u5085\u7acb\u8449",
+        "truncated": false,
+        "backUrl": "http://127.0.0.1:21101/#/note/abc"
+      }
+    },
+    {
+      "case": "explain draft from Personal with title",
+      "target": "explain",
+      "hash": "#/explain?text=What+is+a+Fourier+transform%3F&title=%E4%BF%A1%E8%99%9F%E8%88%87%E7%B3%BB%E7%B5%B1&from=personal&back=%23%2Ftasks%2Ft-1",
+      "expect": {
+        "from": "personal",
+        "text": "What is a Fourier transform?",
+        "title": "\u4fe1\u865f\u8207\u7cfb\u7d71",
+        "truncated": false,
+        "backUrl": "http://127.0.0.1:21103/#/tasks/t-1"
+      }
+    },
+    {
+      "case": "E9 no handoff params",
+      "target": "personal",
+      "hash": "#/tasks",
+      "expect": null
+    },
+    {
+      "case": "unconfigured from",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=pr",
+      "expect": {
+        "rejected": "from"
+      }
+    },
+    {
+      "case": "missing from",
+      "target": "personal",
+      "hash": "#/tasks?draft=x",
+      "expect": {
+        "rejected": "from"
+      }
+    },
+    {
+      "case": "from itself",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=personal",
+      "expect": {
+        "rejected": "from"
+      }
+    },
+    {
+      "case": "empty draft after cleaning",
+      "target": "personal",
+      "hash": "#/tasks?draft=%00%01+&from=explain",
+      "expect": {
+        "rejected": "empty"
+      }
+    },
+    {
+      "case": "absolute back dropped, draft kept",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=explain&back=https%3A%2F%2Fevil.example",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false
+      }
+    },
+    {
+      "case": "protocol-relative back dropped",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=explain&back=%2F%2Fevil.example",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false
+      }
+    },
+    {
+      "case": "javascript back dropped",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=explain&back=javascript%3Aalert(1)",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false
+      }
+    },
+    {
+      "case": "CRLF back dropped",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=explain&back=%23%2Fa%250d%250a",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false
+      }
+    },
+    {
+      "case": "control and bidi characters stripped",
+      "target": "personal",
+      "hash": "#/tasks?draft=a%E2%80%AEb%07c%0Ad&from=explain",
+      "expect": {
+        "from": "explain",
+        "text": "abc\nd",
+        "truncated": false
+      }
+    },
+    {
+      "case": "title ignored for tasks",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&title=y&from=explain",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false
+      }
+    },
+    {
+      "case": "2001 characters truncated",
+      "target": "personal",
+      "repeatDraft": 2001,
+      "expect": {
+        "from": "explain",
+        "textLength": 2000,
+        "truncated": true
+      }
+    },
+    {
+      "case": "back outside the sender's routes dropped (#/settings)",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=explain&back=%23%2Fsettings",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false
+      }
+    },
+    {
+      "case": "back naming the receiver's route dropped (#/tasks from explain)",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=explain&back=%23%2Ftasks",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false
+      }
+    },
+    {
+      "case": "percent in back dropped (double encoding)",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=explain&back=%23%2Fnote%2F%252F%252Fevil",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false
+      }
+    },
+    {
+      "case": "query in back dropped",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=explain&back=%23%2Freview%3Fx%3D1",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false
+      }
+    },
+    {
+      "case": "dot-dot id in back dropped",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=explain&back=%23%2Fnote%2F..",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false
+      }
+    },
+    {
+      "case": "512+ character back dropped",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=explain&back=%23%2Fnote%2Faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false
+      }
+    },
+    {
+      "case": "colon id in back kept",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=explain&back=%23%2Fnote%2Fb%3Ac.d_e-f",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false,
+        "backUrl": "http://127.0.0.1:21101/#/note/b:c.d_e-f"
+      }
+    },
+    {
+      "case": "plain allowed back kept",
+      "target": "personal",
+      "hash": "#/tasks?draft=x&from=explain&back=%23%2Flibrary",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false,
+        "backUrl": "http://127.0.0.1:21101/#/library"
+      }
+    },
+    {
+      "case": "event deep link back from Personal kept",
+      "target": "explain",
+      "hash": "#/explain?text=x&from=personal&back=%23%2Fevents%2Fics%3Afeed-1%3Aabc",
+      "expect": {
+        "from": "personal",
+        "text": "x",
+        "truncated": false,
+        "backUrl": "http://127.0.0.1:21103/#/events/ics:feed-1:abc"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "D9 duplicate draft rejected",
+      "hash": "#/tasks?draft=a&draft=b&from=explain",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "D9 duplicate from rejected though the first is linked",
+      "hash": "#/tasks?draft=x&from=explain&from=pr",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "D9 duplicate from rejected though the last is linked",
+      "hash": "#/tasks?draft=x&from=pr&from=explain",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "D9 duplicate from rejected even when both copies agree",
+      "hash": "#/tasks?draft=x&from=explain&from=explain",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "D9 duplicate back rejected, not only dropped",
+      "hash": "#/tasks?draft=x&from=explain&back=%23%2Flibrary&back=%23%2Freview",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "D9 an empty second back still counts",
+      "hash": "#/tasks?draft=x&from=explain&back=%23%2Flibrary&back=",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "D9 duplicate title rejected on tasks too",
+      "hash": "#/tasks?draft=x&title=a&title=b&from=explain",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "D9 duplicate text rejected on tasks too",
+      "hash": "#/tasks?draft=x&text=a&text=b&from=explain",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "D9 a percent-encoded key is the same key",
+      "hash": "#/tasks?draft=a&dr%61ft=b&from=explain",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "D9 a repeated unrelated key is ignored",
+      "hash": "#/tasks?draft=x&from=explain&utm=1&utm=2",
+      "expect": {
+        "from": "explain",
+        "text": "x",
+        "truncated": false
+      }
+    },
+    {
+      "target": "personal",
+      "case": "E4 D9 a repeated from without a draft is still refused as a repeat",
+      "hash": "#/tasks?from=explain&from=pr",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "D7 LRM and RLM kept in the draft, overrides stripped",
+      "hash": "#/tasks?draft=%E2%80%8F%D7%A9%D7%9C%D7%95%D7%9D%E2%80%AE+%E2%80%8Eabc&from=explain",
+      "expect": {
+        "from": "explain",
+        "text": "\u200f\u05e9\u05dc\u05d5\u05dd \u200eabc",
+        "truncated": false
+      }
+    },
+    {
+      "target": "explain",
+      "case": "D9 duplicate text rejected",
+      "hash": "#/explain?text=a&text=b&from=personal",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "explain",
+      "case": "D9 duplicate title rejected",
+      "hash": "#/explain?text=x&title=a&title=b&from=personal",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "explain",
+      "case": "D9 duplicate from rejected (explain)",
+      "hash": "#/explain?text=x&from=personal&from=pr",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "explain",
+      "case": "D9 duplicate back rejected (explain)",
+      "hash": "#/explain?text=x&from=personal&back=%23%2Ftoday&back=%23%2Ftasks",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "explain",
+      "case": "D9 duplicate draft rejected on explain too",
+      "hash": "#/explain?text=x&draft=a&draft=b&from=personal",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "explain",
+      "case": "D7 title keeps LRM and RLM, drops overrides",
+      "hash": "#/explain?text=x&title=%E2%80%8F%D7%90%E2%80%AE+b&from=personal",
+      "expect": {
+        "from": "personal",
+        "text": "x",
+        "truncated": false,
+        "title": "\u200f\u05d0 b"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "E1 attempt: only from, no draft",
+      "hash": "#/tasks?from=explain",
+      "expect": {
+        "rejected": "missing"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "E2 attempt: only back and from, no draft",
+      "hash": "#/tasks?back=%23%2Flibrary&from=explain",
+      "expect": {
+        "rejected": "missing"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "E3 attempt: title and from, no draft (title is reserved on tasks too)",
+      "hash": "#/tasks?title=x&from=explain",
+      "expect": {
+        "rejected": "missing"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "E5 attempt: Explain's text key is not a to-do draft",
+      "hash": "#/tasks?text=a&from=explain",
+      "expect": {
+        "rejected": "missing"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "attempt: a reserved key without a value",
+      "hash": "#/tasks?back",
+      "expect": {
+        "rejected": "missing"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "attempt: a percent-encoded reserved key counts",
+      "hash": "#/tasks?fr%6Fm=explain",
+      "expect": {
+        "rejected": "missing"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "attempt: an empty draft key is empty, not missing",
+      "hash": "#/tasks?draft=&from=explain",
+      "expect": {
+        "rejected": "empty"
+      }
+    },
+    {
+      "target": "personal",
+      "case": "E10 ordinary: Tasks' own group query is no handoff",
+      "hash": "#/tasks?group=someday",
+      "expect": null
+    },
+    {
+      "target": "personal",
+      "case": "ordinary: reserved keys are case-sensitive",
+      "hash": "#/tasks?Draft=x&From=explain",
+      "expect": null
+    },
+    {
+      "target": "personal",
+      "case": "E10 ordinary: a task deep link with from is no handoff",
+      "hash": "#/tasks/t-1?from=explain",
+      "expect": null
+    },
+    {
+      "target": "explain",
+      "case": "E6 attempt: only from, no text",
+      "hash": "#/explain?from=personal",
+      "expect": {
+        "rejected": "missing"
+      }
+    },
+    {
+      "target": "explain",
+      "case": "attempt: only from and back, no text",
+      "hash": "#/explain?from=personal&back=%23%2Ftoday",
+      "expect": {
+        "rejected": "missing"
+      }
+    },
+    {
+      "target": "explain",
+      "case": "E7 attempt: title and from, no text",
+      "hash": "#/explain?title=x&from=personal",
+      "expect": {
+        "rejected": "missing"
+      }
+    },
+    {
+      "target": "explain",
+      "case": "E8 attempt: Personal's draft key is not an Explain text",
+      "hash": "#/explain?draft=a&from=personal",
+      "expect": {
+        "rejected": "missing"
+      }
+    },
+    {
+      "target": "explain",
+      "case": "attempt: text empty after cleaning",
+      "hash": "#/explain?text=%E2%80%AE%00&from=personal",
+      "expect": {
+        "rejected": "empty"
+      }
+    },
+    {
+      "target": "explain",
+      "case": "D9 a repeated from without text is still refused as a repeat",
+      "hash": "#/explain?from=personal&from=pr",
+      "expect": {
+        "rejected": "duplicate"
+      }
+    },
+    {
+      "target": "explain",
+      "case": "E9 ordinary: #/explain without a query",
+      "hash": "#/explain",
+      "expect": null
+    },
+    {
+      "target": "explain",
+      "case": "E11 ordinary: a query without reserved keys keeps the route",
+      "hash": "#/explain?x=1",
+      "expect": null
+    },
+    {
+      "target": "explain",
+      "case": "E10 ordinary: a note section with from is no handoff",
+      "hash": "#/note/abc/s1?from=personal",
+      "expect": null
+    },
+    {
+      "target": "personal",
+      "case": "E11 ordinary: a query without reserved keys keeps the route",
+      "hash": "#/tasks?x=1",
+      "expect": null
+    },
+    {
+      "target": "personal",
+      "case": "E10 ordinary: Tasks' own focus query is no handoff",
+      "hash": "#/tasks?focus=t-1",
+      "expect": null
+    }
+  ]
+}

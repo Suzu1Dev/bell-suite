@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "appId": "personal",
+  "displayName": "BELL Personal",
+  "summary": "今日與收件匣",
+  "capabilities": [
+    { "id": "tasks.draft", "kind": "accept-handoff", "route": "#/tasks", "accepts": ["text"], "maxChars": 2000 },
+    { "id": "todo.open", "kind": "object-route", "route": "#/tasks/{id}" },
+    { "id": "event.open", "kind": "object-route", "route": "#/events/{id}" },
+    { "id": "idea.open", "kind": "object-route", "route": "#/ideas/{id}" }
+  ],
+  "links": { "explain": "https://box.tail-one.ts.net:20001" }
+}

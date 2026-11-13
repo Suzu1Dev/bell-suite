@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "appId": "reader",
+  "displayName": "BELL Web Reader",
+  "summary": "網頁閱讀與標註",
+  "capabilities": [
+    {
+      "id": "reader.draft",
+      "kind": "accept-handoff",
+      "route": "#/read",
+      "accepts": ["text"],
+      "maxChars": 2000
+    },
+    {
+      "id": "reader.today",
+      "kind": "today-feed",
+      "api": "/api/suite/today"
+    },
+    {
+      "id": "reader.page",
+      "kind": "object-route",
+      "route": "#/page/{id}"
+    }
+  ],
+  "links": {
+    "personal": "http://127.0.0.1:21103",
+    "explain": "http://127.0.0.1:21101"
+  }
+}

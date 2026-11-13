@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "appId": "explain",
+  "generatedAt": "2026-11-08T05:30:00.000Z",
+  "counts": { "due": 12, "newAvailable": 3, "reviewedToday": 5 },
+  "items": [
+    { "sourceApp": "explain", "type": "review-queue", "id": "today", "title": "今日複習", "href": "#/review", "state": "due", "updatedAt": "2026-11-08T05:30:00.000Z", "detail": "12 張到期 · 3 張新卡" },
+    { "sourceApp": "explain", "type": "lesson", "id": "6f1c2a9e-3b7d-4c11-9a3e-0d2f5b8c7e41", "title": "示範資料 · 傅立葉轉換的直覺", "href": "#/note/6f1c2a9e-3b7d-4c11-9a3e-0d2f5b8c7e41", "state": "waiting", "updatedAt": "2026-11-07T14:02:11.000Z" }
+  ],
+  "truncated": false
+}

@@ -1,0 +1,38 @@
+{
+  "ownOrigins": ["https://box.tail-one.ts.net:20003"],
+  "links": [
+    { "value": "", "self": "personal", "ok": {} },
+    { "value": "explain=http://127.0.0.1:21101", "self": "personal", "ok": { "explain": "http://127.0.0.1:21101" } },
+    { "value": "explain=https://box.tail-one.ts.net:20001, pr=http://localhost:4610", "self": "personal", "ok": { "explain": "https://box.tail-one.ts.net:20001", "pr": "http://localhost:4610" } },
+    { "value": "explain=http://127.1:21101", "self": "personal", "ok": { "explain": "http://127.0.0.1:21101" } },
+    { "value": "explain=http://[0:0:0:0:0:0:0:1]:21101", "self": "personal", "ok": { "explain": "http://[::1]:21101" } },
+    { "value": "explain=http://127.0.0.1:80", "self": "personal", "ok": { "explain": "http://127.0.0.1" } },
+    { "value": "explain=https://BOX.tail-one.ts.net:443", "self": "personal", "ok": { "explain": "https://box.tail-one.ts.net" } },
+    { "value": "explain=http://LOCALHOST:21101", "self": "personal", "ok": { "explain": "http://localhost:21101" } },
+    { "value": "explain=http://box.tail-one.ts.net:20001", "self": "personal", "error": "non-loopback http" },
+    { "value": "explain=https://box.tail-two.ts.net:20001", "self": "personal", "error": "other tailnet" },
+    { "value": "explain=https://example.com", "self": "personal", "error": "arbitrary https" },
+    { "value": "explain=https://*.tail-one.ts.net", "self": "personal", "error": "wildcard" },
+    { "value": "explain=https://user:pw@box.tail-one.ts.net:20001", "self": "personal", "error": "credentials" },
+    { "value": "explain=http://127.0.0.1:21101/app", "self": "personal", "error": "path" },
+    { "value": "explain=http://127.0.0.1:21101?x=1", "self": "personal", "error": "query" },
+    { "value": "explain=http://127.0.0.1:21101#x", "self": "personal", "error": "fragment" },
+    { "value": "explain=http://127.0.0.1:21101/", "self": "personal", "error": "trailing slash" },
+    { "value": "personal=http://127.0.0.1:21103", "self": "personal", "error": "own app" },
+    { "value": "calendar=http://127.0.0.1:1", "self": "personal", "error": "unknown app" },
+    { "value": "explain=http://127.0.0.1:1,explain=http://127.0.0.1:2", "self": "personal", "error": "duplicate" },
+    { "value": "explain http://127.0.0.1:1", "self": "personal", "error": "format" }
+  ],
+  "fetch": [
+    { "value": "explain=http://127.0.0.1:20001", "ok": { "explain": "http://127.0.0.1:20001" } },
+    { "value": "explain=http://[::1]:21101", "ok": { "explain": "http://[::1]:21101" } },
+    { "value": "explain=http://127.1:20001", "ok": { "explain": "http://127.0.0.1:20001" } },
+    { "value": "explain=http://127.0.0.1:80", "ok": { "explain": "http://127.0.0.1" } },
+    { "value": "explain=http://localhost:21101", "error": "DNS name" },
+    { "value": "explain=https://127.0.0.1:21101", "error": "https" },
+    { "value": "explain=http://192.168.1.10:20001", "error": "not loopback" },
+    { "value": "explain=https://box.tail-one.ts.net:20001", "error": "tailnet" },
+    { "value": "personal=http://127.0.0.1:21103", "error": "own app" },
+    { "value": "explain=http://127.0.0.1:21101/api", "error": "path" }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "appId": "explain",
+  "displayName": "BELL Explain",
+  "summary": "理解與複習",
+  "capabilities": [
+    { "id": "explain.draft", "kind": "accept-handoff", "route": "#/explain", "accepts": ["text"], "maxChars": 2000 },
+    { "id": "review.today", "kind": "today-feed", "api": "/api/suite/today" },
+    { "id": "review.open", "kind": "object-route", "route": "#/review" },
+    { "id": "note.open", "kind": "object-route", "route": "#/note/{id}" }
+  ],
+  "links": { "personal": "http://127.0.0.1:21103" }
+}

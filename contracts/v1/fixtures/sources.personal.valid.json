@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "sources": [
+    {
+      "appId": "explain",
+      "status": "stale",
+      "lastSuccessAt": "2026-11-08T05:10:00.000Z",
+      "feed": {
+        "schemaVersion": 1, "appId": "explain", "generatedAt": "2026-11-08T05:10:00.000Z",
+        "counts": { "due": 4, "newAvailable": 0, "reviewedToday": 2 },
+        "items": [ { "sourceApp": "explain", "type": "review-queue", "id": "today", "title": "今日複習", "href": "#/review", "state": "due", "updatedAt": "2026-11-08T05:10:00.000Z", "detail": "4 張到期" } ],
+        "truncated": false
+      }
+    },
+    { "appId": "pr", "status": "unsupported" }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "name": "bell-suite",
+  "version": "1.0.1",
+  "description": "Unified local-first workspace orchestrator and cross-app contract for BELL Personal, BELL Explain, BELL PR, BELL Web Reader, and BELL Campaign.",
+  "keywords": [
+    "bell-suite",
+    "local-first",
+    "productivity",
+    "learning",
+    "code-review",
+    "web-reader",
+    "campaign"
+  ],
+  "homepage": "https://github.com/Suzu1Dev/bell-suite",
+  "bugs": {
+    "url": "https://github.com/Suzu1Dev/bell-suite/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Suzu1Dev/bell-suite.git"
+  },
+  "author": "Suzu1Dev",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "bell-suite": "./bin/bell-suite.mjs"
+  },
+  "files": [
+    "bin/",
+    "contracts/",
+    "Formula/",
+    "install.sh",
+    "install.ps1",
+    "LICENSE",
+    "README.md",
+    "README.zh-TW.md",
+    "NOTICE",
+    "TRADEMARKS.md"
+  ],
+  "scripts": {
+    "start": "node ./bin/bell-suite.mjs start",
+    "doctor": "node ./bin/bell-suite.mjs doctor",
+    "status": "node ./bin/bell-suite.mjs status",
+    "check:contract": "node ./contracts/v1/check.mjs",
+    "test": "node ./contracts/v1/check.mjs && node --test ./test/cli.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
