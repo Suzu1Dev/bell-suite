@@ -395,72 +395,13 @@ jobs:
           args: ${{ matrix.platform.tauri_args }}
           releaseId: ${{ needs.create-release.outputs.release_id }}
 
-      - name: Package macOS .app bundle into .app.tar.gz
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          for app_bundle in desktop/target/*/release/bundle/macos/*.app; do
-            bundle_dir="$(dirname "${app_bundle}")"
-            app_base="$(basename "${app_bundle}" .app)"
-            slug="$(printf '%s' "${app_base}" | tr ' ' '-')"
-            archive="${bundle_dir}/${slug}-macos-universal.app.tar.gz"
-            tar -czf "${archive}" -C "${bundle_dir}" "$(basename "${app_bundle}")"
-            echo "Packaged ${archive}"
-          done
-
-      - name: Upload macOS .app.tar.gz to unified GitHub Release
-        if: ${{ runner.os == 'macOS' && needs.create-release.outputs.release_id != '' }}
-        uses: actions/github-script@v7
-        env:
-          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
-        with:
-          script: |
-            const fs = require("node:fs");
-            const path = require("node:path");
-            const releaseId = Number(process.env.RELEASE_ID);
-            const { owner, repo } = context.repo;
-
-            const globDir = path.join(process.cwd(), "desktop", "target", "universal-apple-darwin", "release", "bundle", "macos");
-            if (!fs.existsSync(globDir)) {
-              core.setFailed(`Expected bundle directory missing: ${globDir}`);
-              return;
-            }
-            const archives = fs.readdirSync(globDir).filter((f) => f.endsWith("-macos-universal.app.tar.gz"));
-            if (archives.length === 0) {
-              core.setFailed(`No .app.tar.gz archive found in ${globDir}`);
-              return;
-            }
-
-            const existingAssets = await github.rest.repos.listReleaseAssets({ owner, repo, release_id: releaseId, per_page: 100 });
-            for (const name of archives) {
-              const prev = existingAssets.data.find((a) => a.name === name);
-              if (prev) {
-                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: prev.id });
-              }
-              const data = fs.readFileSync(path.join(globDir, name));
-              await github.rest.repos.uploadReleaseAsset({
-                owner,
-                repo,
-                release_id: releaseId,
-                name,
-                headers: {
-                  "content-type": "application/gzip",
-                  "content-length": data.length,
-                },
-                data,
-              });
-              core.info(`Uploaded ${name} (${data.length} bytes) to release ${releaseId}`);
-            }
-
       - name: Upload installer artifacts (${{ matrix.edition }} - ${{ matrix.platform.os_label }})
         uses: actions/upload-artifact@v4
         with:
           name: bell-${{ matrix.edition }}-${{ matrix.platform.os_label }}
           path: |
             desktop/target/*/release/bundle/dmg/*.dmg
-            desktop/target/*/release/bundle/macos/*-macos-universal.app.tar.gz
+            desktop/target/*/release/bundle/macos/*.app.tar.gz
             desktop/target/*/release/bundle/msi/*.msi
             desktop/target/*/release/bundle/nsis/*-setup.exe
           if-no-files-found: error
