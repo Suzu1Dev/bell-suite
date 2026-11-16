@@ -336,6 +336,7 @@ jobs:
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
         run: |
+          node -e 'const fs=require("node:fs"),p=require("node:path");if(fs.existsSync("desktop/target")){for(const d of fs.readdirSync("desktop/target")){fs.rmSync(p.join("desktop/target",d,"release","bundle"),{recursive:true,force:true});}}'
           node desktop/scripts/generate-icons.mjs
           node desktop/scripts/prepare-edition.mjs ${{ matrix.edition }} --stage-resources --apply
 
@@ -436,6 +437,7 @@ jobs:
           BUNDLE_DIR="$(dirname "${APP_BUNDLE}")"
           APP_BASE="$(basename "${APP_BUNDLE}" .app)"
           DOT_SLUG="$(printf '%s' "${APP_BASE}" | tr ' ' '.')"
+          rm -f "${BUNDLE_DIR}"/*.app.tar.gz "${BUNDLE_DIR}"/*.app.tar.gz.sig
           COPYFILE_DISABLE=1 tar -czf "${BUNDLE_DIR}/${DOT_SLUG}_universal.app.tar.gz" \
             -C "${BUNDLE_DIR}" "$(basename "${APP_BUNDLE}")"
 
