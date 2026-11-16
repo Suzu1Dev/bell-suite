@@ -1,6 +1,6 @@
-# BELL Desktop (`v1.0.3` — macOS & Windows)
+# BELL Desktop (`v1.0.4` — macOS & Windows)
 
-Native macOS Universal (`aarch64` + `x86_64`) and Windows (`x86_64`) desktop application and supervisor for **BELL Suite** and all 5 local-first workspaces, built with a **100% Pure-Rust** desktop workspace (`bell-core`, `bell-hub`, `bell-daemon`, `bell-tauri` — zero TypeScript in `desktop/`), standard Tauri v2 Single-Webview `WebviewWindow` architecture (zero `unstable` feature, zero top chrome bar, built-in `SuiteSwitcher` + `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5` navigation, Linear-grade dual-theme design system), and zero-`node_modules` bundled Node 22 LTS sidecars.
+Native macOS **Apple Silicon (`aarch64`)**, **macOS Intel (`x86_64`)**, and **Windows (`x86_64`)** desktop application and supervisor for **BELL Suite** and all 5 local-first workspaces, built with a **100% Pure-Rust** desktop workspace (`bell-core`, `bell-hub`, `bell-daemon`, `bell-tauri` — zero TypeScript in `desktop/`), standard Tauri v2 Single-Webview `WebviewWindow` architecture, and single-archive (`apps.tar.gz`) minified Node 22 LTS sidecars.
 
 ## Editions
 
@@ -22,18 +22,18 @@ desktop/
 ├── CONTRACT.md                  # Shared Rust <-> Hub <-> Packaging interface contract
 ├── Cargo.toml                   # Pure-Rust workspace (bell-core, bell-hub, bell-daemon, bell-tauri)
 ├── crates/
-│   ├── bell-core/               # Process supervisor, port allocation, Today feed, atomic SQLite vault backups
+│   ├── bell-core/               # Supervisor, apps.tar.gz cache unpacker, Today feed, atomic SQLite backups
 │   ├── bell-hub/                # Pure-Rust Linear-grade Suite Hub asset emitter (`build-hub-dist` -> hub-dist/)
 │   ├── bell-daemon/             # Loopback HTTP control plane (127.0.0.1:4600) serving hub-dist + REST API
 │   └── bell-tauri/              # Native Tauri v2 Single-Webview (`WebviewWindow`) app + menu/tray + Shortcuts
 ├── hub-dist/                    # Generated static Hub assets (`index.html`, `hub.css`, `hub.js`)
 ├── icons/                       # Generated squircle PNG/ICO/ICNS icons for all 6 editions
 ├── editions/                    # Tauri v2 configs (tauri.<edition>.conf.json) + macOS entitlements plists
-├── dist-sidecars/               # Gitignored self-contained CJS workspace bundles + embedded Node runtime
+├── dist-sidecars/               # Gitignored minified CJS workspace bundles + embedded Node runtime
 └── scripts/
     ├── generate-icons.mjs       # Pure Node RGBA/ICO/ICNS icon generator (zero external dependencies)
-    ├── bundle-sidecars.mjs      # Bundles all 5 backends into dist-sidecars/apps/<id>/server.cjs + smoke test
-    └── prepare-edition.mjs      # Generates & optionally stages/applies per-edition Tauri v2 configs
+    ├── bundle-sidecars.mjs      # Minifies & bundles all 5 backends into dist-sidecars/apps/<id>/server.cjs
+    └── prepare-edition.mjs      # Generates edition configs & packs staged apps/ into single apps.tar.gz
 ```
 
 ## Build & Packaging Commands
@@ -51,32 +51,24 @@ cargo test --manifest-path desktop/Cargo.toml -p bell-core -p bell-hub -p bell-d
 cargo run --manifest-path desktop/Cargo.toml -p bell-hub --bin build-hub-dist
 ```
 
-### 3. Bundle Zero-`node_modules` Sidecars & Smoke-Verify
+### 3. Bundle Minified Zero-`node_modules` Sidecars & Smoke-Verify
 
 ```bash
 node desktop/scripts/bundle-sidecars.mjs --verify
 ```
 
-Data-directory environment variables respected by each bundled sidecar:
-- `personal`: `BELLPERSONAL_DATA_DIR` (also accepts `BELL_DATA_DIR`)
-- `explain`: `BELL_DATA_DIR` / `BELL_EXPLAIN_DATA_DIR` / `BELL_DATA_PATH`
-- `pr`: `BELLPR_DATA_DIR` (also accepts `BELLPR_HOME` / `BELL_DATA_DIR`)
-- `reader`: `BELL_READER_DATA_DIR` (also accepts `BELL_DATA_DIR`)
-- `campaign`: `BELL_CAMPAIGN_DATA_DIR` (also accepts `BELL_DATA_DIR`)
-
-### 4. Prepare Edition Configs
+### 4. Prepare Edition Configs & Single-Archive Resource Staging
 
 ```bash
-# Generate desktop/editions/tauri.<edition>.conf.json for all 6 editions
+# Generate canonical desktop/editions/tauri.<edition>.conf.json for all 6 editions
 node desktop/scripts/prepare-edition.mjs all
 
-# Stage single-app sidecar resources + apply icons & config to crates/bell-tauri/tauri.conf.json
-node desktop/scripts/prepare-edition.mjs explain --stage-resources --apply
+# Pack single apps.tar.gz into editions/.staged/<id>/dist-sidecars + apply config & icons
+node desktop/scripts/prepare-edition.mjs suite --stage-resources --apply
 ```
 
-## Security & CI Verification Guarantees
+## Launch-Speed & Security Guarantees (`v1.0.4`)
 
-- **Zero-TypeScript Desktop Gate**: CI fails immediately if any `.ts` or `.tsx` file exists inside `desktop/`.
-- **Single-Webview Full-Frame Isolation**: Standard stable `WebviewWindow` navigates directly between the embedded Hub and `http://127.0.0.1:<port>` workspaces (built-in `SuiteSwitcher` + native `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5`), preserving every app's strict CSP (`frame-ancestors 'none'`) without iframes or multi-webview clipping.
-- **Physical macOS `WindowServer` Verification**: `.github/workflows/desktop-release.yml` verifies deep bundle code signatures (`codesign --verify --deep --strict`), runs live `WKWebView` + sidecar self-tests (`BELL_DESKTOP_SELFTEST_OUT`), and queries macOS `WindowServer` via CoreGraphics (`CGWindowListCopyWindowInfo(.optionOnScreenOnly)`) to prove a physical onscreen `NSWindow` (`>= 800x550`) renders before packaging `.dmg` / `.app.tar.gz`.
-- **Zero-Install Embedded Runtime & Atomic Vault**: Embeds SHA-256 verified Node.js `v22.22.1` LTS (`bell-runtime` Universal Mach-O on macOS, `bell-runtime.exe` on Windows x64 with `CREATE_NO_WINDOW`) and snapshots SQLite databases atomically.
+- **Single `apps.tar.gz` Sidecar Bundle (`<= 6` Sealed Files)**: Packaged installers ship only `edition.json`, `apps.tar.gz`, and `bin/bell-runtime(.exe)` inside `dist-sidecars/` (eliminating 482 loose files from macOS `syspolicyd` / `XProtect` / `CodeResources` scanning) and unpack once into `<vault>/runtime-cache/<edition>-<version>/`.
+- **Native Stripped `aarch64` & `x64` Binaries**: Separate native Apple Silicon (`_aarch64.dmg`) and Intel (`_x64.dmg`) builds with `strip -x` on `bell-runtime` and `[profile.release] strip = "symbols", lto = "thin"` on `bell-desktop`.
+- **Millisecond CI Launch Gate**: `.github/workflows/desktop-release.yml` enforces Zero-TypeScript in `desktop/`, `<= 15` sealed resource files, `codesign --verify --deep --strict`, live `WKWebView` + sidecar self-tests, and a compiled Swift CoreGraphics `WindowServer` stopwatch (`COLD_WINDOW_OPEN_MS` + `WARM_WINDOW_OPEN_MS < 2000ms`).

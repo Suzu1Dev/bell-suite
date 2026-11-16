@@ -11,6 +11,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder, Submenu, SubmenuBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -48,6 +49,7 @@ struct AppState {
     supervisor: Arc<Supervisor>,
     hub_url: Mutex<Url>,
     initial_pr_port: u16,
+    today_refresh_inflight: AtomicBool,
     selftest: Option<Arc<SelftestCoordinator>>,
 }
 
@@ -215,7 +217,7 @@ fn try_complete_selftest(app: &AppHandle, force_timeout: bool) {
         return;
     }
 
-    let status = state.supervisor.status();
+    let status = state.supervisor.status_with_deep_vault();
     let installed_count = status.workspaces.iter().filter(|w| w.installed).count();
     let healthy_running_count = status
         .workspaces
@@ -257,24 +259,50 @@ fn try_complete_selftest(app: &AppHandle, force_timeout: bool) {
         sup.shutdown_all().await;
         let code = if all_ok { 0 } else { 1 };
         handle.exit(code);
-        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
         std::process::exit(code);
     });
 }
 
 #[tauri::command]
 async fn desktop_hub_render(
+    app: AppHandle,
     state: State<'_, AppState>,
     ui: Option<HubUiClientState>,
 ) -> Result<HubViewPatch, String> {
     let ui = ui.unwrap_or_default();
-    let status = state.supervisor.status();
+    let status = if ui.view == "vault" {
+        state.supervisor.status_with_deep_vault()
+    } else {
+        state.supervisor.status()
+    };
+
     let need_today = matches!(ui.view.as_str(), "" | "overview" | "today") || ui.palette_open;
     let today_val = if need_today {
-        Some(state.supervisor.today().await)
+        let cached = state.supervisor.cached_today();
+        let any_running = status
+            .workspaces
+            .iter()
+            .any(|w| w.state == WorkspaceState::Running);
+        if any_running
+            && !state.supervisor.is_today_cache_fresh(Duration::from_secs(4))
+            && !state.today_refresh_inflight.swap(true, Ordering::SeqCst)
+        {
+            let sup_bg = state.supervisor.clone();
+            let app_bg = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = sup_bg.refresh_today().await;
+                if let Some(st) = app_bg.try_state::<AppState>() {
+                    st.today_refresh_inflight.store(false, Ordering::SeqCst);
+                }
+                notify_hub_sync(&app_bg);
+            });
+        }
+        cached
     } else {
         None
     };
+
     let logs_val = if ui.view == "logs" {
         let logs_app = ui
             .logs_app
@@ -358,6 +386,7 @@ async fn desktop_workspace_action(
         .workspace_action(app_id, &action)
         .await
         .map_err(|e| e.to_string())?;
+    let _ = state.supervisor.refresh_today().await;
     notify_hub_sync(&app);
     Ok(status)
 }
@@ -367,11 +396,15 @@ async fn desktop_start_all(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<DesktopStatus, String> {
+    let app_each = app.clone();
     let status = state
         .supervisor
-        .start_all()
+        .start_all_staggered(move || {
+            notify_hub_sync(&app_each);
+        })
         .await
         .map_err(|e| e.to_string())?;
+    let _ = state.supervisor.refresh_today().await;
     notify_hub_sync(&app);
     Ok(status)
 }
@@ -626,29 +659,24 @@ fn main() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
+            let vault_root = bell_core::default_vault_root();
+            let pr_token = bell_core::ensure_pr_api_token_at_root(&vault_root).unwrap_or_default();
+            let initial_pr_port = AppId::Pr.default_port();
+
             let resource_dir = app.path().resource_dir().ok();
             let supervisor = Supervisor::new(SupervisorConfig {
                 edition,
+                vault_dir: Some(vault_root),
                 resource_dir,
                 ..Default::default()
             })?;
 
-            // Always greet BELL Suite with BELL Hub on fresh app launch
+            // Zero-I/O in-memory reset so BELL Suite opens immediately onto BELL Hub
             if edition == Edition::Suite {
-                let _ = supervisor.activate("hub");
+                supervisor.set_active_target_in_memory("hub");
             }
-
-            // Pre-allocate ports & PR bearer token BEFORE building WebviewWindow so
-            // origin-guarded initialization_script always knows PR's port and secret.
-            supervisor.preallocate_all_ports();
-            let pr_token = supervisor.ensure_pr_api_token().unwrap_or_default();
-            let initial_status = supervisor.status();
-            let initial_pr_port = initial_status
-                .workspaces
-                .iter()
-                .find(|w| w.id == AppId::Pr)
-                .map(|w| w.port)
-                .unwrap_or_else(|| AppId::Pr.default_port());
+            let initial_theme = supervisor.cached_theme_pref();
+            let should_start = supervisor.cached_auto_start_pref() || selftest_out.is_some();
 
             let selftest = selftest_out.map(|out_path| {
                 Arc::new(SelftestCoordinator {
@@ -677,7 +705,7 @@ fn main() {
             .center()
             .visible(true)
             .focused(true)
-            .theme(parse_tauri_theme(&initial_status.prefs.theme))
+            .theme(parse_tauri_theme(&initial_theme))
             .on_new_window(move |url, _features| {
                 let is_workspace_url = (url.scheme() == "http" || url.scheme() == "https")
                     && matches!(url.host_str(), Some("127.0.0.1" | "localhost"))
@@ -729,6 +757,7 @@ fn main() {
                 supervisor: supervisor.clone(),
                 hub_url: Mutex::new(captured_hub_url),
                 initial_pr_port,
+                today_refresh_inflight: AtomicBool::new(false),
                 selftest: selftest.clone(),
             });
 
@@ -739,13 +768,38 @@ fn main() {
             let _ = window.show();
             let _ = window.set_focus();
 
-            let should_start = initial_status.prefs.auto_start || selftest.is_some();
-            if should_start {
-                let sup_bg = supervisor.clone();
-                let handle_bg = app.handle().clone();
-                let selftest_bg = selftest.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = sup_bg.start_all().await;
+            // Offload sidecar archive extraction, $PATH CLI probes, deep SQLite inspection,
+            // and sequential sidecar warmup onto background workers AFTER window is visible.
+            let sup_bg = supervisor.clone();
+            let handle_bg = app.handle().clone();
+            let selftest_bg = selftest.clone();
+            tauri::async_runtime::spawn(async move {
+                if edition == Edition::Suite && selftest_bg.is_none() {
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                }
+
+                let sup_warm = sup_bg.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    sup_warm.ensure_sidecars_ready();
+                    sup_warm.refresh_caches_blocking();
+                })
+                .await;
+                notify_hub_sync(&handle_bg);
+
+                if should_start {
+                    let h_each = handle_bg.clone();
+                    let _ = sup_bg
+                        .start_all_staggered(move || {
+                            notify_hub_sync(&h_each);
+                        })
+                        .await;
+                    let _ = sup_bg.refresh_today().await;
+                    let sup_deep = sup_bg.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        sup_deep.refresh_caches_blocking();
+                    })
+                    .await;
+
                     if let Some(primary) = edition.primary_app() {
                         if selftest_bg.is_none() {
                             navigate_to_workspace(&handle_bg, primary, None);
@@ -753,19 +807,18 @@ fn main() {
                     } else {
                         notify_hub_sync(&handle_bg);
                     }
-                    if let Some(st) = selftest_bg {
-                        st.autostart_done.store(true, Ordering::SeqCst);
-                        try_complete_selftest(&handle_bg, false);
-                    }
-                });
-            } else if let Some(ref st) = selftest {
-                st.autostart_done.store(true, Ordering::SeqCst);
-            }
+                }
+
+                if let Some(st) = selftest_bg {
+                    st.autostart_done.store(true, Ordering::SeqCst);
+                    try_complete_selftest(&handle_bg, false);
+                }
+            });
 
             if selftest.is_some() {
                 let watchdog_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+                    tokio::time::sleep(Duration::from_secs(40)).await;
                     try_complete_selftest(&watchdog_handle, true);
                 });
             }

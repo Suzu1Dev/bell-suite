@@ -1,6 +1,6 @@
-# BELL Desktop Shared Interface Contract (`v1.0.3`)
+# BELL Desktop Shared Interface Contract (`v1.0.4`)
 
-Single source of truth for the 100% Pure-Rust workspace (`crates/bell-core`, `crates/bell-hub`, `crates/bell-daemon`, `crates/bell-tauri` — zero TypeScript in `desktop/`, generating `hub-dist/` via Cargo), Single-Webview `WebviewWindow` shell (zero top chrome bar; built-in `SuiteSwitcher` + `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5` navigation + Linear-grade design system), and Packaging/CI (`scripts/`, `.github/workflows/desktop-release.yml`).
+Single source of truth for the 100% Pure-Rust workspace (`crates/bell-core`, `crates/bell-hub`, `crates/bell-daemon`, `crates/bell-tauri` — zero TypeScript in `desktop/`, generating `hub-dist/` via Cargo), Single-Webview `WebviewWindow` shell (zero top chrome bar; built-in `SuiteSwitcher` + `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5` navigation + Linear-grade design system), and Packaging/CI (`scripts/`, `.github/workflows/desktop-release.yml` — single-archive `apps.tar.gz` + stripped native `aarch64`/`x64` binaries).
 
 ## 1. Products & Ground-Truth Brand Tokens
 
@@ -46,7 +46,7 @@ desktop/dist-sidecars/
 ```
 
 Runtime resolution order in `bell-core`:
-1. `BELL_DESKTOP_SIDECARS_DIR` env var (if set), else `<resource_dir>/dist-sidecars`, else `<repo>/desktop/dist-sidecars`.
+1. `BELL_DESKTOP_SIDECARS_DIR` env var (if set), else `<resource_dir>/dist-sidecars` (if `apps.tar.gz` is present in packaged installers, `bell-core` unpacks it once into `<vault>/runtime-cache/<edition>-<version>/` so macOS `CodeResources` seals `<= 6` files instead of 482 loose files), else `<repo>/desktop/dist-sidecars`.
 2. Runtime binary: `BELL_DESKTOP_RUNTIME_BIN` env var, else `<sidecars_dir>/bin/bell-runtime(.exe)`, else `node` on `PATH`.
 3. If `dist-sidecars/apps/<id>/server.cjs` exists, spawn `<runtime> server.cjs` with `cwd = <sidecars_dir>/apps/<id>` and `build_suite_env(...)` (plus CLI args `start --port <port> --host 127.0.0.1 --no-open` + `--force` for `pr` when `server.cjs` is `bell-pr`'s CLI).
    - **Important**: `bundle-sidecars.mjs` ensures every app's `server.cjs` accepts uniform env vars (`HOST=127.0.0.1`, `PORT=<port>`, plus app-specific `BELL*_HOST`, `BELL*_PORT`, `BELL*_DATA_DIR`, `BELL*_SUITE_LINKS`, `BELL*_SUITE_FETCH`, `BELL_NO_OPEN=1`, `BELLPR_NO_OPEN=1`) and starts listening immediately when run as `<runtime> server.cjs` (no extra CLI subcommand required, or standard `start --port <port> --host 127.0.0.1 --no-open`). Specifically: `bundle-sidecars.mjs` wraps `pr` so `<runtime> server.cjs` runs `start --port $PORT --host $HOST --no-open --force` automatically!
@@ -58,7 +58,7 @@ Runtime resolution order in `bell-core`:
 ```json
 {
   "edition": "suite",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "os": "macos",
   "arch": "aarch64",
   "activeTarget": "hub",

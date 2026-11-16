@@ -250,7 +250,7 @@ async fn handle_health(State(state): State<DaemonState>) -> impl IntoResponse {
 }
 
 async fn handle_status(State(state): State<DaemonState>) -> impl IntoResponse {
-    Json(state.supervisor.status())
+    Json(state.supervisor.status_with_deep_vault())
 }
 
 async fn handle_today(State(state): State<DaemonState>) -> impl IntoResponse {
@@ -391,10 +391,21 @@ async fn handle_hub_render(
         return Json(patch).into_response();
     }
 
-    let status = state.supervisor.status();
+    let status = if ui.view == "vault" {
+        state.supervisor.status_with_deep_vault()
+    } else {
+        state.supervisor.status()
+    };
     let need_today = matches!(ui.view.as_str(), "" | "overview" | "today") || ui.palette_open;
     let today_val = if need_today {
-        Some(state.supervisor.today().await)
+        if state
+            .supervisor
+            .is_today_cache_fresh(std::time::Duration::from_secs(4))
+        {
+            state.supervisor.cached_today()
+        } else {
+            Some(state.supervisor.refresh_today().await)
+        }
     } else {
         None
     };
@@ -685,10 +696,20 @@ async fn main() {
     };
     let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(cli.port);
 
-    if !cli.no_autostart && supervisor.status().prefs.auto_start {
+    let auto_start_enabled = supervisor.cached_auto_start_pref();
+    let sup_warmup = supervisor.clone();
+    tokio::task::spawn_blocking(move || {
+        sup_warmup.ensure_sidecars_ready();
+        sup_warmup.refresh_caches_blocking();
+    });
+
+    if !cli.no_autostart && auto_start_enabled {
         let sup_bg = supervisor.clone();
         tokio::spawn(async move {
-            let _ = sup_bg.start_all().await;
+            let _ = sup_bg.start_all_staggered(|| {}).await;
+            let _ = sup_bg.refresh_today().await;
+            let sup_deep = sup_bg.clone();
+            let _ = tokio::task::spawn_blocking(move || sup_deep.refresh_caches_blocking()).await;
         });
     }
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -86,13 +87,20 @@ const ICON_FILES = ["32x32.png", "128x128.png", "128x128@2x.png", "512x512.png",
 function stageResourcesForEdition(spec) {
   const stagedRoot = path.join(EDITIONS_DIR, ".staged", spec.id);
   const stagedSidecars = path.join(stagedRoot, "dist-sidecars");
+  const tempAppsStage = path.join(stagedRoot, "_tmp_apps_stage");
   rmSync(stagedRoot, { recursive: true, force: true });
   mkdirSync(path.join(stagedSidecars, "bin"), { recursive: true });
-  mkdirSync(path.join(stagedSidecars, "apps"), { recursive: true });
+  mkdirSync(path.join(tempAppsStage, "apps"), { recursive: true });
 
   const binSrc = path.join(SIDECARS_DIR, "bin");
   if (existsSync(binSrc)) {
     cpSync(binSrc, path.join(stagedSidecars, "bin"), { recursive: true });
+    if (
+      existsSync(path.join(stagedSidecars, "bin", "bell-runtime")) ||
+      existsSync(path.join(stagedSidecars, "bin", "bell-runtime.exe"))
+    ) {
+      rmSync(path.join(stagedSidecars, "bin", ".keep"), { force: true });
+    }
   } else {
     writeFileSync(path.join(stagedSidecars, "bin", ".keep"), "");
   }
@@ -102,13 +110,33 @@ function stageResourcesForEdition(spec) {
     if (!existsSync(appsSrc)) {
       throw new Error(`Missing ${appsSrc}. Run bundle-sidecars.mjs before --stage-resources.`);
     }
-    cpSync(appsSrc, path.join(stagedSidecars, "apps"), { recursive: true });
+    cpSync(appsSrc, path.join(tempAppsStage, "apps"), { recursive: true });
   } else {
     const appSrc = path.join(SIDECARS_DIR, "apps", spec.id);
     if (!existsSync(appSrc)) {
       throw new Error(`Missing ${appSrc}. Run bundle-sidecars.mjs before --stage-resources.`);
     }
-    cpSync(appSrc, path.join(stagedSidecars, "apps", spec.id), { recursive: true });
+    cpSync(appSrc, path.join(tempAppsStage, "apps", spec.id), { recursive: true });
+  }
+
+  const archivePath = path.join(stagedSidecars, "apps.tar.gz");
+  const tarRes = spawnSync(
+    "tar",
+    ["-czf", path.join("dist-sidecars", "apps.tar.gz"), "-C", "_tmp_apps_stage", "apps"],
+    {
+      cwd: stagedRoot,
+      env: { ...process.env, COPYFILE_DISABLE: "1" },
+      encoding: "utf8",
+    },
+  );
+  rmSync(tempAppsStage, { recursive: true, force: true });
+  if (tarRes.status !== 0) {
+    throw new Error(
+      `Failed to pack apps.tar.gz for ${spec.id} (status ${tarRes.status}): ${tarRes.stderr || tarRes.error?.message || ""}`,
+    );
+  }
+  if (!existsSync(archivePath) || statSync(archivePath).size <= 100_000) {
+    throw new Error(`apps.tar.gz missing or too small (<100KB) at ${archivePath}`);
   }
 
   writeFileSync(

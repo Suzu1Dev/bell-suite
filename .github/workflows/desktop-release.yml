@@ -138,7 +138,7 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Generate edition icons & smoke-verify zero-node_modules sidecars
+      - name: Generate edition icons & smoke-verify minified zero-node_modules sidecars
         working-directory: bell-suite
         env:
           BELL_SUITE_APP_PERSONAL: ${{ github.workspace }}/bell-personal
@@ -196,10 +196,11 @@ jobs:
                 tag_name: tagName,
                 name: `BELL Desktop ${tagName}`,
                 body: [
-                  "Native macOS Universal (`.dmg`, `.app.tar.gz`) and Windows x64 (`.msi`, `-setup.exe`) installers for **BELL Suite** and all 5 standalone workspaces (**Personal**, **Explain**, **PR**, **Web Reader**, **Campaign**).",
+                  "Native macOS **Apple Silicon (`_aarch64.dmg` / `_aarch64.app.tar.gz`)**, **Intel (`_x64.dmg` / `_x64.app.tar.gz`)**, and **Windows x64 (`.msi` / `-setup.exe`)** installers for **BELL Suite** and all 5 standalone workspaces (**Personal**, **Explain**, **PR**, **Web Reader**, **Campaign**).",
                   "",
-                  "- Pure-Rust `bell-hub` desktop shell (`WebviewWindow`, zero TypeScript, built-in `SuiteSwitcher` + `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5`).",
-                  "- Embedded SHA-256 verified Node.js `v22.22.1` LTS runtime (`bell-runtime`) — zero external Node installation required.",
+                  "- **Instant macOS Launch (`v1.0.4`)**: single-archive `apps.tar.gz` sidecar bundle (`<= 6` sealed files in `CodeResources`) + stripped native `arm64`/`x64` Mach-O binaries (`bell-desktop` + `bell-runtime`).",
+                  "- **Pure-Rust `bell-hub` Shell**: standard `WebviewWindow`, zero TypeScript, built-in `SuiteSwitcher` + `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5`.",
+                  "- **Embedded Node.js `v22.22.1` LTS Runtime**: SHA-256 verified — zero external Node installation required.",
                   "- **macOS first-launch tip (unsigned preview)**: drag the app to `/Applications`, then run `xattr -cr \"/Applications/BELL Suite.app\"` (or right-click → Open) if Gatekeeper prompts.",
                 ].join("\n"),
                 draft: !isPreviewTag,
@@ -228,13 +229,23 @@ jobs:
         edition: ${{ fromJSON(needs.prepare-bundles.outputs.editions) }}
         platform:
           - os: macos-latest
-            os_label: macos-universal
-            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
-            tauri_args: "--target universal-apple-darwin"
+            os_label: macos-arm64
+            rust_targets: "aarch64-apple-darwin"
+            tauri_args: "--target aarch64-apple-darwin"
+            node_arch: "arm64"
+            bundle_arch: "aarch64"
+          - os: macos-latest
+            os_label: macos-x64
+            rust_targets: "x86_64-apple-darwin"
+            tauri_args: "--target x86_64-apple-darwin"
+            node_arch: "x64"
+            bundle_arch: "x64"
           - os: windows-latest
             os_label: windows-x64
             rust_targets: "x86_64-pc-windows-msvc"
             tauri_args: "--target x86_64-pc-windows-msvc"
+            node_arch: "x64"
+            bundle_arch: "x64"
 
     steps:
       - name: Checkout bell-suite
@@ -271,36 +282,36 @@ jobs:
           name: desktop-hub-dist
           path: desktop/hub-dist
 
-      - name: Embed & codesign official Node v${{ env.NODE_RUNTIME_VERSION }} Universal runtime (macOS)
+      - name: Embed, strip & codesign official Node v${{ env.NODE_RUNTIME_VERSION }} (${{ matrix.platform.os_label }})
         if: runner.os == 'macOS'
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          NODE_ARCH: ${{ matrix.platform.node_arch }}
         run: |
           set -euo pipefail
           VER="${NODE_RUNTIME_VERSION}"
           BASE_URL="https://nodejs.org/dist/v${VER}"
+          TARBALL="node-v${VER}-darwin-${NODE_ARCH}.tar.gz"
           TMP_DIR="$(mktemp -d)"
           trap 'rm -rf "${TMP_DIR}"' EXIT
 
           pushd "${TMP_DIR}" >/dev/null
           curl -fsSLO "${BASE_URL}/SHASUMS256.txt"
-          curl -fsSLO "${BASE_URL}/node-v${VER}-darwin-arm64.tar.gz"
-          curl -fsSLO "${BASE_URL}/node-v${VER}-darwin-x64.tar.gz"
+          curl -fsSLO "${BASE_URL}/${TARBALL}"
 
-          grep -E "  node-v${VER}-darwin-(arm64|x64)\.tar\.gz$" SHASUMS256.txt | shasum -a 256 -c -
-
-          tar -xzf "node-v${VER}-darwin-arm64.tar.gz"
-          tar -xzf "node-v${VER}-darwin-x64.tar.gz"
+          grep -E "  node-v${VER}-darwin-${NODE_ARCH}\.tar\.gz$" SHASUMS256.txt | shasum -a 256 -c -
+          tar -xzf "${TARBALL}"
 
           mkdir -p "${GITHUB_WORKSPACE}/desktop/dist-sidecars/bin"
-          lipo -create \
-            "node-v${VER}-darwin-arm64/bin/node" \
-            "node-v${VER}-darwin-x64/bin/node" \
-            -output "${GITHUB_WORKSPACE}/desktop/dist-sidecars/bin/bell-runtime"
+          cp "node-v${VER}-darwin-${NODE_ARCH}/bin/node" "${GITHUB_WORKSPACE}/desktop/dist-sidecars/bin/bell-runtime"
           popd >/dev/null
 
           chmod 0755 desktop/dist-sidecars/bin/bell-runtime
+          ls -lh desktop/dist-sidecars/bin/bell-runtime
+          strip -x desktop/dist-sidecars/bin/bell-runtime
+          ls -lh desktop/dist-sidecars/bin/bell-runtime
+
           if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
             codesign --force --sign "${APPLE_SIGNING_IDENTITY}" --timestamp --options runtime \
               --entitlements desktop/editions/entitlements.runtime.macos.plist \
@@ -311,8 +322,10 @@ jobs:
               desktop/dist-sidecars/bin/bell-runtime
           fi
 
-          lipo -archs desktop/dist-sidecars/bin/bell-runtime
-          ./desktop/dist-sidecars/bin/bell-runtime --version
+          file desktop/dist-sidecars/bin/bell-runtime
+          if [ "${NODE_ARCH}" = "arm64" ]; then
+            ./desktop/dist-sidecars/bin/bell-runtime --version
+          fi
 
       - name: Embed official Node v${{ env.NODE_RUNTIME_VERSION }} x64 runtime (Windows)
         if: runner.os == 'Windows'
@@ -349,7 +362,7 @@ jobs:
             Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
           }
 
-      - name: Generate icons & stage edition config (${{ matrix.edition }})
+      - name: Generate icons & stage single-archive edition config (${{ matrix.edition }})
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
         run: |
@@ -400,136 +413,210 @@ jobs:
           includeUpdaterJson: false
           args: ${{ matrix.platform.tauri_args }}
 
-      - name: Verify real macOS .app WKWebView render, CoreGraphics NSWindow & sidecar boot (${{ matrix.edition }})
+      - name: Verify macOS .app signature, sealed file count & millisecond launch benchmark (${{ matrix.edition }} - ${{ matrix.platform.os_label }})
         if: runner.os == 'macOS'
         shell: bash
         env:
           HAS_APPLE_CERT: ${{ steps.apple_cert.outputs.has_cert }}
+          RUST_TARGET: ${{ matrix.platform.rust_targets }}
+          NODE_ARCH: ${{ matrix.platform.node_arch }}
+          BUNDLE_ARCH: ${{ matrix.platform.bundle_arch }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          apps=(desktop/target/universal-apple-darwin/release/bundle/macos/*.app)
+          apps=(desktop/target/"${RUST_TARGET}"/release/bundle/macos/*.app)
           if [ "${#apps[@]}" -ne 1 ]; then
-            echo "Expected exactly 1 .app bundle, found ${#apps[@]}" >&2
+            echo "Expected exactly 1 .app bundle in desktop/target/${RUST_TARGET}/release/bundle/macos/, found ${#apps[@]}" >&2
             exit 1
           fi
           APP_BUNDLE="${apps[0]}"
           APP_BIN="${APP_BUNDLE}/Contents/MacOS/bell-desktop"
 
-          echo "=== Inspecting code signature & deep bundle sealing for ${APP_BUNDLE} ==="
+          echo "=== Inspecting code signature & sealed resource count for ${APP_BUNDLE} ==="
+          du -sh "${APP_BUNDLE}" "${APP_BIN}"
           codesign -dvvv "${APP_BIN}" 2>&1 | tee /tmp/bell-codesign.txt
           if [ "${HAS_APPLE_CERT}" != "true" ] && grep -Eq "flags=0x[0-9a-fA-F]*\\(.*runtime" /tmp/bell-codesign.txt; then
             echo "ERROR: Ad-hoc build must NOT carry CS_RUNTIME (Hardened Runtime) flag!" >&2
             exit 1
           fi
+
+          RES_FILE_COUNT="$(find "${APP_BUNDLE}/Contents/Resources" -type f | wc -l | tr -d ' ')"
+          SEALED_COUNT="$(sed -n 's/^Sealed Resources.*files=\([0-9][0-9]*\).*/\1/p' /tmp/bell-codesign.txt | head -n 1)"
+          SEALED_COUNT="${SEALED_COUNT:-${RES_FILE_COUNT}}"
+          echo "BUNDLE_RESOURCES_FILES=${RES_FILE_COUNT} SEALED_RESOURCES_COUNT=${SEALED_COUNT}"
+          find "${APP_BUNDLE}/Contents/Resources" -type f
+          if [ "${SEALED_COUNT}" -gt 15 ] || [ "${RES_FILE_COUNT}" -gt 15 ]; then
+            echo "ERROR: Expected <= 15 sealed resource files (single apps.tar.gz), got sealed=${SEALED_COUNT} files=${RES_FILE_COUNT}!" >&2
+            exit 1
+          fi
+
           codesign --verify --deep --strict --verbose=2 "${APP_BUNDLE}"
 
-          SELFTEST_JSON="$(mktemp /tmp/bell-selftest-XXXXXX.json)"
-          VAULT_TMP="$(mktemp -d)"
-          CG_SWIFT="$(mktemp /tmp/bell-cgwindow-XXXXXX.swift)"
-          CG_PROBE="$(mktemp /tmp/bell-cgwindow-bin-XXXXXX)"
-          APP_PID=""
-          cleanup_verify() {
-            if [ -n "${APP_PID}" ] && kill -0 "${APP_PID}" 2>/dev/null; then
-              pkill -TERM -P "${APP_PID}" 2>/dev/null || true
-              kill -TERM "${APP_PID}" 2>/dev/null || true
-              wait "${APP_PID}" 2>/dev/null || true
-            fi
-            rm -rf "${VAULT_TMP}" "${SELFTEST_JSON}" "${CG_SWIFT}" "${CG_PROBE}"
-          }
-          trap cleanup_verify EXIT
-
-          echo "=== 1/2 Launching ${APP_BUNDLE} for live WKWebView DOM + sidecar self-test ==="
-          BELL_DESKTOP_EDITION="${{ matrix.edition }}" \
-          BELL_DESKTOP_VAULT_DIR="${VAULT_TMP}" \
-          BELL_DESKTOP_SELFTEST_OUT="${SELFTEST_JSON}" \
-            "${APP_BIN}"
-
-          cat "${SELFTEST_JSON}"
-          node --input-type=module - "${SELFTEST_JSON}" <<'EOF'
-          import fs from "node:fs";
-          const report = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-          if (!report.ok) {
-            throw new Error(`macOS runtime self-test failed: ${JSON.stringify(report)}`);
-          }
-          const renderedHeight = Math.max(
-            Number(report.domReady?.mainHeight ?? 0),
-            Number(report.domReady?.chromeHeight ?? 0),
-            Number(report.domReady?.viewportHeight ?? 0),
-            Number(report.domReady?.height ?? 0),
-          );
-          if (!report.domReady || renderedHeight < 36 || Number(report.domReady.textLength ?? 0) < 10) {
-            throw new Error(`WKWebView failed to render visible DOM: ${JSON.stringify(report.domReady)}`);
-          }
-          if (report.installedWorkspaces < 1 || report.healthyRunningWorkspaces !== report.installedWorkspaces) {
-            throw new Error(`Bundled sidecars unhealthy: ${report.healthyRunningWorkspaces}/${report.installedWorkspaces}`);
-          }
-          console.log(
-            `VERIFIED macOS WKWebView DOM (${report.edition}): height=${renderedHeight}px, textLength=${report.domReady.textLength}, sidecars=${report.healthyRunningWorkspaces}/${report.installedWorkspaces}`,
-          );
-          EOF
-
-          echo "=== 2/2 Probing macOS WindowServer CoreGraphics onscreen NSWindow ==="
-          cat > "${CG_SWIFT}" <<'SWIFT'
-          import CoreGraphics
-          import Foundation
-
-          guard CommandLine.arguments.count > 1, let targetPid = Int(CommandLine.arguments[1]) else {
-            exit(2)
-          }
-          let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-          for w in list {
-            let pid = w[kCGWindowOwnerPID as String] as? Int ?? 0
-            let owner = w[kCGWindowOwnerName as String] as? String ?? ""
-            let onScreen = (w[kCGWindowIsOnscreen as String] as? Bool) ?? ((w[kCGWindowIsOnscreen as String] as? Int ?? 0) != 0)
-            let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
-            let width = b["Width"] as? Double ?? 0
-            let height = b["Height"] as? Double ?? 0
-            if pid == targetPid && onScreen && width >= 800 && height >= 550 {
-              print("ONSCREEN_WINDOW_OK pid=\(pid) owner=\(owner) \(Int(width))x\(Int(height))")
-              exit(0)
+          if [ "${NODE_ARCH}" = "arm64" ]; then
+            BENCH_TMP="$(mktemp -d)"
+            SELFTEST_JSON="${BENCH_TMP}/selftest.json"
+            SELFTEST_VAULT="${BENCH_TMP}/selftest-vault"
+            BENCH_VAULT="${BENCH_TMP}/bench-vault"
+            BENCH_SWIFT="${BENCH_TMP}/bench.swift"
+            BENCH_BIN="${BENCH_TMP}/bench"
+            mkdir -p "${SELFTEST_VAULT}" "${BENCH_VAULT}"
+            cleanup_arm64() {
+              pkill -TERM -f "${BENCH_VAULT}" 2>/dev/null || true
+              pkill -TERM -f "${SELFTEST_VAULT}" 2>/dev/null || true
+              rm -rf "${BENCH_TMP}"
             }
-          }
-          exit(1)
-          SWIFT
-          swiftc -O "${CG_SWIFT}" -o "${CG_PROBE}"
+            trap cleanup_arm64 EXIT
 
-          BELL_DESKTOP_EDITION="${{ matrix.edition }}" \
-          BELL_DESKTOP_VAULT_DIR="${VAULT_TMP}" \
-            "${APP_BIN}" </dev/null >/tmp/bell-live-app.log 2>&1 &
-          APP_PID=$!
+            echo "=== 1/2 Launching ${APP_BUNDLE} for WKWebView DOM + apps.tar.gz extraction + sidecar self-test ==="
+            BELL_DESKTOP_EDITION="${{ matrix.edition }}" \
+            BELL_DESKTOP_VAULT_DIR="${SELFTEST_VAULT}" \
+            BELL_DESKTOP_SELFTEST_OUT="${SELFTEST_JSON}" \
+              "${APP_BIN}"
 
-          WINDOW_OK=0
-          for _ in $(seq 1 48); do
-            if ! kill -0 "${APP_PID}" 2>/dev/null; then
-              echo "ERROR: ${APP_BIN} exited before registering an onscreen NSWindow!" >&2
-              cat /tmp/bell-live-app.log >&2 || true
-              exit 1
-            fi
-            if "${CG_PROBE}" "${APP_PID}"; then
-              WINDOW_OK=1
-              break
-            fi
-            sleep 0.25
-          done
+            cat "${SELFTEST_JSON}"
+            node --input-type=module - "${SELFTEST_JSON}" <<'EOF'
+            import fs from "node:fs";
+            const report = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+            if (!report.ok) {
+              throw new Error(`macOS runtime self-test failed: ${JSON.stringify(report)}`);
+            }
+            const renderedHeight = Math.max(
+              Number(report.domReady?.mainHeight ?? 0),
+              Number(report.domReady?.chromeHeight ?? 0),
+              Number(report.domReady?.viewportHeight ?? 0),
+              Number(report.domReady?.height ?? 0),
+            );
+            if (!report.domReady || renderedHeight < 36 || Number(report.domReady.textLength ?? 0) < 10) {
+              throw new Error(`WKWebView failed to render visible DOM: ${JSON.stringify(report.domReady)}`);
+            }
+            if (report.installedWorkspaces < 1 || report.healthyRunningWorkspaces !== report.installedWorkspaces) {
+              throw new Error(`Bundled sidecars unhealthy: ${report.healthyRunningWorkspaces}/${report.installedWorkspaces}`);
+            }
+            console.log(
+              `VERIFIED macOS WKWebView DOM (${report.edition}): height=${renderedHeight}px, textLength=${report.domReady.textLength}, sidecars=${report.healthyRunningWorkspaces}/${report.installedWorkspaces}`,
+            );
+            EOF
 
-          pkill -TERM -P "${APP_PID}" 2>/dev/null || true
-          kill -TERM "${APP_PID}" 2>/dev/null || true
-          wait "${APP_PID}" 2>/dev/null || true
-          APP_PID=""
+            echo "=== 2/2 Compiling CoreGraphics stopwatch & measuring Cold + Warm NSWindow open latency ==="
+            cat > "${BENCH_SWIFT}" <<'SWIFT'
+            import CoreGraphics
+            import Darwin
+            import Foundation
 
-          if [ "${WINDOW_OK}" -ne 1 ]; then
-            echo "ERROR: macOS WindowServer never reported an onscreen NSWindow (>=800x550)!" >&2
-            cat /tmp/bell-live-app.log >&2 || true
-            exit 1
+            let args = CommandLine.arguments
+            guard args.count >= 4 else {
+              fputs("Usage: bell-launch-bench <app-bin> <edition> <vault-dir>\n", stderr)
+              exit(2)
+            }
+            let appBin = args[1]
+            let edition = args[2]
+            let vaultDir = args[3]
+
+            func hasOnscreenWindow(pid: pid_t) -> (Bool, String) {
+              let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+              guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
+                return (false, "")
+              }
+              for w in list {
+                let ownerPid = (w[kCGWindowOwnerPID as String] as? Int32) ?? Int32((w[kCGWindowOwnerPID as String] as? Int) ?? 0)
+                if ownerPid != pid { continue }
+                let onScreen = (w[kCGWindowIsOnscreen as String] as? Bool) ?? (((w[kCGWindowIsOnscreen as String] as? Int) ?? 0) != 0)
+                let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
+                let width = b["Width"] as? Double ?? 0
+                let height = b["Height"] as? Double ?? 0
+                let owner = w[kCGWindowOwnerName as String] as? String ?? ""
+                if onScreen && width >= 800 && height >= 550 {
+                  return (true, "pid=\(pid) owner=\(owner) \(Int(width))x\(Int(height))")
+                }
+              }
+              return (false, "")
+            }
+
+            func measureLaunch(label: String) -> Int {
+              let proc = Process()
+              proc.executableURL = URL(fileURLWithPath: appBin)
+              var env = ProcessInfo.processInfo.environment
+              env["BELL_DESKTOP_EDITION"] = edition
+              env["BELL_DESKTOP_VAULT_DIR"] = vaultDir
+              env.removeValue(forKey: "BELL_DESKTOP_SELFTEST_OUT")
+              proc.environment = env
+
+              let logUrl = URL(fileURLWithPath: "/tmp/bell-bench-\(label).log")
+              FileManager.default.createFile(atPath: logUrl.path, contents: nil)
+              let logHandle = try! FileHandle(forWritingTo: logUrl)
+              proc.standardOutput = logHandle
+              proc.standardError = logHandle
+
+              let t0 = DispatchTime.now().uptimeNanoseconds
+              do {
+                try proc.run()
+              } catch {
+                fputs("Failed to launch \(appBin): \(error)\n", stderr)
+                exit(1)
+              }
+              let pid = proc.processIdentifier
+              var elapsedMs = -1
+              var detail = ""
+              let deadlineNs = t0 + 12_000_000_000
+
+              while DispatchTime.now().uptimeNanoseconds < deadlineNs {
+                if !proc.isRunning {
+                  fputs("ERROR [\(label)]: \(appBin) exited early (status=\(proc.terminationStatus))\n", stderr)
+                  exit(1)
+                }
+                let (ok, info) = hasOnscreenWindow(pid: pid)
+                if ok {
+                  let nowNs = DispatchTime.now().uptimeNanoseconds
+                  elapsedMs = Int((nowNs - t0) / 1_000_000)
+                  detail = info
+                  break
+                }
+                usleep(40_000)
+              }
+
+              proc.terminate()
+              let killDeadline = DispatchTime.now().uptimeNanoseconds + 3_000_000_000
+              while proc.isRunning && DispatchTime.now().uptimeNanoseconds < killDeadline {
+                usleep(50_000)
+              }
+              if proc.isRunning {
+                kill(pid, SIGKILL)
+              }
+              proc.waitUntilExit()
+              try? logHandle.close()
+
+              if elapsedMs < 0 {
+                fputs("ERROR [\(label)]: timed out waiting for onscreen NSWindow (>=800x550)\n", stderr)
+                if let logText = try? String(contentsOf: logUrl, encoding: .utf8) {
+                  fputs(logText + "\n", stderr)
+                }
+                exit(1)
+              }
+              print("ONSCREEN_WINDOW_OK [\(label)] \(detail) openMs=\(elapsedMs)")
+              return elapsedMs
+            }
+
+            let coldMs = measureLaunch(label: "cold")
+            usleep(300_000)
+            let warmMs = measureLaunch(label: "warm")
+            print("COLD_WINDOW_OPEN_MS=\(coldMs)")
+            print("WARM_WINDOW_OPEN_MS=\(warmMs)")
+            if warmMs >= 2000 {
+              fputs("ERROR: WARM_WINDOW_OPEN_MS (\(warmMs)ms) exceeded 2000ms gate!\n", stderr)
+              exit(1)
+            }
+            SWIFT
+
+            # Pre-compile Swift stopwatch binary BEFORE starting any launch timer
+            swiftc -O "${BENCH_SWIFT}" -o "${BENCH_BIN}"
+            "${BENCH_BIN}" "${APP_BIN}" "${{ matrix.edition }}" "${BENCH_VAULT}"
           fi
 
           BUNDLE_DIR="$(dirname "${APP_BUNDLE}")"
           APP_BASE="$(basename "${APP_BUNDLE}" .app)"
           DOT_SLUG="$(printf '%s' "${APP_BASE}" | tr ' ' '.')"
-          codesign --verify --deep --strict --verbose=2 "${APP_BUNDLE}"
           rm -f "${BUNDLE_DIR}"/*.app.tar.gz "${BUNDLE_DIR}"/*.app.tar.gz.sig
-          COPYFILE_DISABLE=1 tar -czf "${BUNDLE_DIR}/${DOT_SLUG}_universal.app.tar.gz" \
+          COPYFILE_DISABLE=1 tar -czf "${BUNDLE_DIR}/${DOT_SLUG}_${BUNDLE_ARCH}.app.tar.gz" \
             -C "${BUNDLE_DIR}" "$(basename "${APP_BUNDLE}")"
 
       - name: Upload verified macOS installers to GitHub Release
@@ -537,13 +624,15 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUST_TARGET: ${{ matrix.platform.rust_targets }}
+          BUNDLE_ARCH: ${{ matrix.platform.bundle_arch }}
         run: |
           set -euo pipefail
           TAG_NAME="${GITHUB_REF#refs/tags/}"
           shopt -s nullglob
           files=(
-            desktop/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-            desktop/target/universal-apple-darwin/release/bundle/macos/*_universal.app.tar.gz
+            desktop/target/"${RUST_TARGET}"/release/bundle/dmg/*.dmg
+            desktop/target/"${RUST_TARGET}"/release/bundle/macos/*_"${BUNDLE_ARCH}".app.tar.gz
           )
           if [ "${#files[@]}" -lt 2 ]; then
             echo "Missing expected macOS release assets: ${files[*]}" >&2

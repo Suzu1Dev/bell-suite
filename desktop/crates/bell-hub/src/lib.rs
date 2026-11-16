@@ -86,7 +86,7 @@ pub const HUB_BOOT_JS: &str = r###"(function () {
   }
 
   const initShell = document.querySelector("#hub-root .hub-shell");
-  const initCount = initShell && initShell.dataset.todayCount ? Number(initShell.dataset.todayCount) : null;
+  const initCount = initShell && initShell.dataset.todayLive === "1" && initShell.dataset.todayCount ? Number(initShell.dataset.todayCount) : null;
 
   const uiState = {
     view: qs.get("view") || "overview",
@@ -1362,14 +1362,72 @@ pub fn render_hub_patch(model: &HubRenderModel<'_>) -> HubViewPatch {
     }
 }
 
+fn build_boot_skeleton_status() -> DesktopStatus {
+    let edition = Edition::active();
+    let workspaces: Vec<WorkspaceStatus> = AppId::ALL
+        .iter()
+        .map(|&id| WorkspaceStatus {
+            id,
+            name: id.display_name().to_string(),
+            shortcut_index: id.shortcut_index(),
+            accent_light: id.accent_light().to_string(),
+            accent_dark: id.accent_dark().to_string(),
+            port: id.default_port(),
+            url: format!("http://127.0.0.1:{}", id.default_port()),
+            state: WorkspaceState::Stopped,
+            pid: None,
+            manifest_valid: false,
+            installed: true,
+            db_bytes: 0,
+            restart_count: 0,
+            last_error: None,
+        })
+        .collect();
+
+    DesktopStatus {
+        edition,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        active_target: "hub".to_string(),
+        runtime: RuntimeInfo {
+            kind: "bundled".to_string(),
+            path: String::new(),
+            claude_cli: false,
+            codex_cli: false,
+            gh_cli: false,
+            git_cli: false,
+        },
+        prefs: DesktopPrefs {
+            theme: "system".to_string(),
+            lang: "zh-tw".to_string(),
+            active_target: "hub".to_string(),
+            auto_start: true,
+        },
+        workspaces,
+        vault: VaultStatus {
+            root_dir: "—".to_string(),
+            total_bytes: 0,
+            quota_bytes: 5 * 1024 * 1024 * 1024,
+            backups_count: 0,
+            last_backup_at: None,
+            databases: Vec::new(),
+        },
+    }
+}
+
 pub fn render_initial_html() -> String {
-    let (demo_status, demo_today, demo_logs) = build_demo_status(Edition::Suite, "dark", "zh-tw");
-    let default_ui = HubUiClientState::default();
+    let boot_status = build_boot_skeleton_status();
+    let boot_ui = HubUiClientState {
+        view: "overview".to_string(),
+        busy_label: Some("正在連線本機工作區…".to_string()),
+        ..Default::default()
+    };
     let initial_patch = render_hub_patch(&HubRenderModel {
-        status: &demo_status,
-        today: Some(&demo_today),
-        logs: Some(&demo_logs),
-        ui: &default_ui,
+        status: &boot_status,
+        today: None,
+        logs: None,
+        ui: &boot_ui,
     });
 
     format!(
@@ -1839,9 +1897,18 @@ mod tests {
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains(r#"id="hub-root""#));
         assert!(html.contains("./hub.css"));
+        assert!(html.contains("./hub.js"));
         assert!(html.contains("./favicon.svg"));
         assert!(FAVICON_SVG.contains("<svg"));
         assert!(!html.contains("chrome-bar"));
+        // Boot skeleton must be truthful: all 5 workspaces present, zero fake demo items or PIDs
+        assert!(html.contains("BELL Personal"));
+        assert!(html.contains("BELL Campaign"));
+        assert!(html.contains("0.0 MB / 5.0 GB"));
+        assert!(!html.contains("PR #148"));
+        assert!(!html.contains("note-tauri-v2"));
+        assert!(!html.contains("28410"));
+        assert!(!html.contains(r#"data-today-live="1""#));
 
         let ico = build_favicon_ico_bytes();
         assert_eq!(&ico[0..6], &[0, 0, 1, 0, 2, 0]);

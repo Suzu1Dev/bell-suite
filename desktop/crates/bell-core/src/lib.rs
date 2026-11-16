@@ -14,8 +14,8 @@ pub use supervisor::{
     WorkspaceLogs, WorkspaceState, WorkspaceStatus,
 };
 pub use vault::{
-    default_vault_root, DesktopPrefs, PrefsPatch, Vault, VaultBackupResult, VaultDatabase,
-    VaultError, VaultStatus,
+    default_vault_root, ensure_pr_api_token_at_root, read_pr_api_token_at_root, DesktopPrefs,
+    PrefsPatch, Vault, VaultBackupResult, VaultDatabase, VaultError, VaultStatus,
 };
 
 #[cfg(test)]
@@ -723,5 +723,127 @@ srv.listen(port, "127.0.0.1");
 
         sup.shutdown_all().await;
         drop(blocker);
+    }
+
+    #[tokio::test]
+    async fn apps_tar_gz_unpack_ready_cache_and_zero_sqlite_pr_token_work() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+        let vault_dir = tmp.path().join("vault");
+        let sidecars_dir = tmp.path().join("sidecars");
+        std::fs::create_dir_all(&sidecars_dir).unwrap();
+
+        // 1. Verify ensure_pr_api_token_at_root works with zero SQLite files on disk!
+        let fast_tok = ensure_pr_api_token_at_root(&vault_dir).unwrap();
+        assert_eq!(fast_tok.len(), 64);
+        assert!(fast_tok.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!vault_dir.join("desktop-prefs.sqlite").exists());
+        assert_eq!(ensure_pr_api_token_at_root(&vault_dir).unwrap(), fast_tok);
+
+        // 2. Build a real apps.tar.gz containing apps/explain/server.cjs
+        let server_code = br#"
+const http = require("node:http");
+const port = Number(process.env.PORT || 4602);
+const srv = http.createServer((req, res) => {
+  if (req.url === "/api/suite/manifest") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      schemaVersion: 1,
+      appId: "explain",
+      displayName: "BELL Explain",
+      summary: "Packed sidecar test",
+      capabilities: [],
+      links: {}
+    }));
+    return;
+  }
+  res.writeHead(200);
+  res.end("ok");
+});
+process.on("SIGTERM", () => srv.close(() => process.exit(0)));
+srv.listen(port, "127.0.0.1");
+"#;
+        let tar_gz_path = sidecars_dir.join("apps.tar.gz");
+        {
+            let file = std::fs::File::create(&tar_gz_path).unwrap();
+            let enc = GzEncoder::new(file, Compression::fast());
+            let mut tar = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(server_code.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, "apps/explain/server.cjs", &server_code[..])
+                .unwrap();
+            tar.finish().unwrap();
+        }
+
+        let sup = Supervisor::new(SupervisorConfig {
+            edition: Edition::Explain,
+            base_port: 49400,
+            vault_dir: Some(vault_dir.clone()),
+            sidecars_dir: Some(sidecars_dir.clone()),
+            resource_dir: None,
+            allow_dev_fallback: false,
+            ready_timeout: Duration::from_secs(10),
+        })
+        .unwrap();
+
+        // Before unpacking apps.tar.gz, status() already reports Explain installed: true in 0ms!
+        let cache_dir = vault_dir
+            .join("runtime-cache")
+            .join(format!("explain-{}", env!("CARGO_PKG_VERSION")));
+        assert!(!cache_dir.exists());
+        let pre_status = sup.status();
+        let explain_pre = pre_status
+            .workspaces
+            .iter()
+            .find(|w| w.id == AppId::Explain)
+            .unwrap();
+        assert!(explain_pre.installed);
+
+        // start_all_staggered unpacks apps.tar.gz, writes .ready, and boots Explain cleanly
+        let callbacks = std::sync::Arc::new(AtomicUsize::new(0));
+        let cb_clone = callbacks.clone();
+        let started = sup
+            .start_all_staggered(move || {
+                cb_clone.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        assert!(cache_dir.join(".ready").is_file());
+        let explain_run = started
+            .workspaces
+            .iter()
+            .find(|w| w.id == AppId::Explain)
+            .unwrap();
+        assert_eq!(explain_run.state, WorkspaceState::Running);
+        assert!(explain_run.manifest_valid);
+        sup.shutdown_all().await;
+
+        // Corrupt apps.tar.gz on disk to prove warm boot reuses .ready cache without re-unpacking!
+        std::fs::write(&tar_gz_path, b"not-a-gzip-anymore").unwrap();
+        let sup2 = Supervisor::new(SupervisorConfig {
+            edition: Edition::Explain,
+            base_port: 49410,
+            vault_dir: Some(vault_dir),
+            sidecars_dir: Some(sidecars_dir),
+            resource_dir: None,
+            allow_dev_fallback: false,
+            ready_timeout: Duration::from_secs(10),
+        })
+        .unwrap();
+        sup2.ensure_sidecars_ready();
+        let st2 = sup2.start_workspace(AppId::Explain).await.unwrap();
+        let explain2 = st2
+            .workspaces
+            .iter()
+            .find(|w| w.id == AppId::Explain)
+            .unwrap();
+        assert_eq!(explain2.state, WorkspaceState::Running);
+        sup2.shutdown_all().await;
     }
 }

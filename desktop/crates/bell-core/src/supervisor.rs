@@ -7,20 +7,25 @@ use crate::vault::{
     default_vault_root, DesktopPrefs, PrefsPatch, Vault, VaultBackupResult, VaultError,
     VaultStatus,
 };
+use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::{self, File};
+use std::io::{self, BufReader};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tar::Archive;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
 
 pub const LOG_RING_CAPACITY: usize = 200;
+const VAULT_CACHE_TTL: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -143,6 +148,7 @@ struct WorkspaceSlot {
 
 struct InnerState {
     active_target: String,
+    prefs: DesktopPrefs,
     slots: BTreeMap<AppId, WorkspaceSlot>,
 }
 
@@ -159,6 +165,10 @@ pub struct Supervisor {
     sidecars_dir: Option<PathBuf>,
     suite_root: Option<PathBuf>,
     state: Arc<Mutex<InnerState>>,
+    sidecars_unpacked: Mutex<bool>,
+    runtime_cache: Mutex<Option<RuntimeInfo>>,
+    vault_cache: Mutex<Option<(Instant, VaultStatus, bool)>>,
+    today_cache: Mutex<Option<(Instant, TodayOverview)>>,
     op_locks: BTreeMap<AppId, Arc<AsyncMutex<()>>>,
     http_client: reqwest::Client,
 }
@@ -167,15 +177,20 @@ impl Supervisor {
     pub fn new(config: SupervisorConfig) -> Result<Arc<Self>, SupervisorError> {
         let vault_root = config.vault_dir.clone().unwrap_or_else(default_vault_root);
         let vault = Vault::open(vault_root)?;
-        let prefs = vault.load_prefs().unwrap_or_default();
+        let mut prefs = vault.load_prefs().unwrap_or_default();
         let initial_target = if is_valid_target(&prefs.active_target) {
-            prefs.active_target
+            prefs.active_target.clone()
         } else {
             "hub".to_string()
         };
+        prefs.active_target = initial_target.clone();
 
         let sidecars_dir = resolve_sidecars_dir(&config);
-        let suite_root = discover_suite_root();
+        let suite_root = if config.allow_dev_fallback && sidecars_dir.is_none() {
+            discover_suite_root()
+        } else {
+            None
+        };
 
         let mut slots = BTreeMap::new();
         let mut op_locks = BTreeMap::new();
@@ -210,8 +225,13 @@ impl Supervisor {
             suite_root,
             state: Arc::new(Mutex::new(InnerState {
                 active_target: initial_target,
+                prefs,
                 slots,
             })),
+            sidecars_unpacked: Mutex::new(false),
+            runtime_cache: Mutex::new(None),
+            vault_cache: Mutex::new(None),
+            today_cache: Mutex::new(None),
             op_locks,
             http_client,
         }))
@@ -225,6 +245,32 @@ impl Supervisor {
         &self.vault
     }
 
+    pub fn cached_theme_pref(&self) -> String {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prefs
+            .theme
+            .clone()
+    }
+
+    pub fn cached_auto_start_pref(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prefs
+            .auto_start
+    }
+
+    pub fn set_active_target_in_memory(&self, target: &str) {
+        let norm = target.trim().to_ascii_lowercase();
+        if is_valid_target(&norm) {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.active_target = norm.clone();
+            guard.prefs.active_target = norm;
+        }
+    }
+
     pub fn pr_api_token(&self) -> Option<String> {
         self.vault.read_pr_api_token()
     }
@@ -235,6 +281,60 @@ impl Supervisor {
 
     pub fn preallocate_all_ports(&self) {
         self.preallocate_ports(&AppId::ALL);
+    }
+
+    fn extracted_cache_root(&self) -> PathBuf {
+        self.vault.root_dir().join("runtime-cache").join(format!(
+            "{}-{}",
+            self.config.edition.as_str(),
+            env!("CARGO_PKG_VERSION")
+        ))
+    }
+
+    /// Idempotently unpacks `<sidecars_dir>/apps.tar.gz` into `<vault_root>/runtime-cache/<edition>-<version>/`
+    /// when loose `apps/<id>/server.cjs` files are not present on disk.
+    pub fn ensure_sidecars_ready(&self) {
+        let mut unpacked = self
+            .sidecars_unpacked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *unpacked {
+            return;
+        }
+        let Some(ref sc_dir) = self.sidecars_dir else {
+            *unpacked = true;
+            return;
+        };
+
+        if AppId::ALL
+            .iter()
+            .any(|app| sc_dir.join("apps").join(app.as_str()).join("server.cjs").is_file())
+        {
+            *unpacked = true;
+            return;
+        }
+
+        let archive_path = sc_dir.join("apps.tar.gz");
+        if !archive_path.is_file() {
+            *unpacked = true;
+            return;
+        }
+
+        let cache_dir = self.extracted_cache_root();
+        let ready_marker = cache_dir.join(".ready");
+        if ready_marker.is_file() && cache_dir.join("apps").is_dir() {
+            *unpacked = true;
+            return;
+        }
+
+        if unpack_apps_archive(&archive_path, &cache_dir).is_ok() {
+            let _ = fs::write(&ready_marker, env!("CARGO_PKG_VERSION"));
+            *unpacked = true;
+        }
+    }
+
+    fn invalidate_vault_cache(&self) {
+        *self.vault_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn ordered_apps(&self) -> Vec<AppId> {
@@ -251,11 +351,11 @@ impl Supervisor {
         }
     }
 
-    fn resolve_runtime(&self) -> (String, String) {
+    fn resolve_bundled_runtime(&self) -> Option<(String, String)> {
         if let Ok(raw) = std::env::var("BELL_DESKTOP_RUNTIME_BIN") {
             let p = PathBuf::from(raw.trim());
             if p.is_file() {
-                return ("bundled".to_string(), p.to_string_lossy().into_owned());
+                return Some(("bundled".to_string(), p.to_string_lossy().into_owned()));
             }
         }
         if let Some(ref sc_dir) = self.sidecars_dir {
@@ -266,10 +366,27 @@ impl Supervisor {
             };
             let bundled = sc_dir.join("bin").join(bin_name);
             if bundled.is_file() {
-                return (
+                return Some((
                     "bundled".to_string(),
                     bundled.to_string_lossy().into_owned(),
-                );
+                ));
+            }
+        }
+        None
+    }
+
+    fn resolve_runtime(&self) -> (String, String) {
+        if let Some(bundled) = self.resolve_bundled_runtime() {
+            return bundled;
+        }
+        if let Some(cached) = self
+            .runtime_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            if !cached.path.is_empty() {
+                return (cached.kind.clone(), cached.path.clone());
             }
         }
         if let Some(node) = find_executable("node") {
@@ -278,16 +395,61 @@ impl Supervisor {
         ("missing".to_string(), String::new())
     }
 
+    pub fn runtime_info_fast(&self) -> RuntimeInfo {
+        if let Some(cached) = self
+            .runtime_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return cached;
+        }
+        if let Some((kind, path)) = self.resolve_bundled_runtime() {
+            return RuntimeInfo {
+                kind,
+                path,
+                claude_cli: false,
+                codex_cli: false,
+                gh_cli: false,
+                git_cli: false,
+            };
+        }
+        let (kind, path) = match find_executable("node") {
+            Some(node) => ("system".to_string(), node.to_string_lossy().into_owned()),
+            None => ("missing".to_string(), String::new()),
+        };
+        RuntimeInfo {
+            kind,
+            path,
+            claude_cli: false,
+            codex_cli: false,
+            gh_cli: false,
+            git_cli: false,
+        }
+    }
+
     pub fn runtime_info(&self) -> RuntimeInfo {
         let (kind, path) = self.resolve_runtime();
-        RuntimeInfo {
+        let info = RuntimeInfo {
             kind,
             path,
             claude_cli: find_executable("claude").is_some(),
             codex_cli: find_executable("codex").is_some(),
             gh_cli: find_executable("gh").is_some(),
             git_cli: find_executable("git").is_some(),
-        }
+        };
+        *self
+            .runtime_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(info.clone());
+        info
+    }
+
+    pub fn refresh_caches_blocking(&self) {
+        let _ = self.runtime_info();
+        let deep = self.vault.scan();
+        *self.vault_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now(), deep, true));
     }
 
     fn discover_app_source(&self, app: AppId) -> Option<AppLaunchSource> {
@@ -298,6 +460,15 @@ impl Supervisor {
                 return Some(AppLaunchSource::Sidecar {
                     dir: app_dir,
                     entry,
+                });
+            }
+
+            let cache_app_dir = self.extracted_cache_root().join("apps").join(app.as_str());
+            let cache_entry = cache_app_dir.join("server.cjs");
+            if cache_entry.is_file() {
+                return Some(AppLaunchSource::Sidecar {
+                    dir: cache_app_dir,
+                    entry: cache_entry,
                 });
             }
         }
@@ -314,7 +485,8 @@ impl Supervisor {
             }
         }
 
-        if let Some(ref root) = self.suite_root {
+        let root_opt = self.suite_root.clone().or_else(discover_suite_root);
+        if let Some(ref root) = root_opt {
             let rels: &[&str] = match app {
                 AppId::Personal => &[
                     "worktrees/personal-bot-suite",
@@ -378,25 +550,74 @@ impl Supervisor {
         None
     }
 
-    pub fn status(&self) -> DesktopStatus {
-        let vault_status = self.vault.scan();
+    fn is_app_installed(&self, app: AppId) -> bool {
+        if self.discover_app_source(app).is_some() {
+            return true;
+        }
+        if self
+            .sidecars_dir
+            .as_ref()
+            .is_some_and(|d| d.join("apps.tar.gz").is_file())
+        {
+            return match self.config.edition.primary_app() {
+                None => true,
+                Some(primary) => primary == app,
+            };
+        }
+        false
+    }
+
+    fn cached_or_fast_vault_status(&self) -> VaultStatus {
+        {
+            let guard = self.vault_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((ts, ref cached, _)) = *guard {
+                if ts.elapsed() < VAULT_CACHE_TTL {
+                    return cached.clone();
+                }
+            }
+        }
+        let fast = self.vault.scan_fast();
+        *self.vault_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now(), fast.clone(), false));
+        fast
+    }
+
+    fn cached_or_deep_vault_status(&self) -> VaultStatus {
+        {
+            let guard = self.vault_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((ts, ref cached, is_deep)) = *guard {
+                if is_deep && ts.elapsed() < VAULT_CACHE_TTL {
+                    return cached.clone();
+                }
+            }
+        }
+        let deep = self.vault.scan();
+        *self.vault_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now(), deep.clone(), true));
+        deep
+    }
+
+    fn build_status(&self, vault_status: VaultStatus) -> DesktopStatus {
         let mut db_bytes_by_app: BTreeMap<AppId, u64> = BTreeMap::new();
         for db in &vault_status.databases {
             *db_bytes_by_app.entry(db.app_id).or_insert(0) += db.bytes;
         }
 
-        let mut prefs = self.vault.load_prefs().unwrap_or_default();
-        let runtime = self.runtime_info();
+        let runtime = self.runtime_info_fast();
         let apps = self.ordered_apps();
+        let installed_flags: BTreeMap<AppId, bool> = apps
+            .iter()
+            .map(|&app| (app, self.is_app_installed(app)))
+            .collect();
 
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let active_target = guard.active_target.clone();
+        let mut prefs = guard.prefs.clone();
         prefs.active_target = active_target.clone();
 
         let mut workspaces = Vec::with_capacity(apps.len());
         for app in apps {
             let slot = &guard.slots[&app];
-            let installed = self.discover_app_source(app).is_some();
             workspaces.push(WorkspaceStatus {
                 id: app,
                 name: app.display_name().to_string(),
@@ -408,7 +629,7 @@ impl Supervisor {
                 state: slot.state,
                 pid: slot.pid,
                 manifest_valid: slot.manifest_valid,
-                installed,
+                installed: installed_flags.get(&app).copied().unwrap_or(false),
                 db_bytes: db_bytes_by_app.get(&app).copied().unwrap_or(0),
                 restart_count: slot.restart_count,
                 last_error: slot.last_error.clone(),
@@ -429,7 +650,31 @@ impl Supervisor {
         }
     }
 
-    pub async fn today(&self) -> TodayOverview {
+    pub fn status(&self) -> DesktopStatus {
+        self.build_status(self.cached_or_fast_vault_status())
+    }
+
+    pub fn status_with_deep_vault(&self) -> DesktopStatus {
+        self.build_status(self.cached_or_deep_vault_status())
+    }
+
+    pub fn cached_today(&self) -> Option<TodayOverview> {
+        self.today_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(_, ov)| ov.clone())
+    }
+
+    pub fn is_today_cache_fresh(&self, max_age: Duration) -> bool {
+        self.today_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(ts, _)| ts.elapsed() < max_age)
+    }
+
+    pub async fn refresh_today(&self) -> TodayOverview {
         let running: Vec<(AppId, u16)> = {
             let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard
@@ -443,7 +688,14 @@ impl Supervisor {
         if let Some(tok) = self.pr_api_token() {
             tokens.insert(AppId::Pr, tok);
         }
-        aggregate_today_with_tokens(&running, &tokens).await
+        let overview = aggregate_today_with_tokens(&running, &tokens).await;
+        *self.today_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now(), overview.clone()));
+        overview
+    }
+
+    pub async fn today(&self) -> TodayOverview {
+        self.refresh_today().await
     }
 
     pub fn activate(&self, target: &str) -> Result<DesktopStatus, SupervisorError> {
@@ -454,6 +706,7 @@ impl Supervisor {
         {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             guard.active_target = normalized.clone();
+            guard.prefs.active_target = normalized.clone();
         }
         let _ = self.vault.update_prefs(PrefsPatch {
             active_target: Some(normalized),
@@ -468,16 +721,21 @@ impl Supervisor {
             if !is_valid_target(&norm) {
                 return Err(SupervisorError::InvalidTarget(target.clone()));
             }
-            patch.active_target = Some(norm.clone());
-            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            guard.active_target = norm;
+            patch.active_target = Some(norm);
         }
-        self.vault.update_prefs(patch)?;
+        let updated = self.vault.update_prefs(patch)?;
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.active_target = updated.active_target.clone();
+            guard.prefs = updated;
+        }
         Ok(self.status())
     }
 
     pub fn backup_vault(&self) -> Result<VaultBackupResult, SupervisorError> {
-        Ok(self.vault.backup_vault()?)
+        let res = self.vault.backup_vault()?;
+        self.invalidate_vault_cache();
+        Ok(res)
     }
 
     pub fn logs(&self, id: AppId) -> WorkspaceLogs {
@@ -524,6 +782,8 @@ impl Supervisor {
                 return Ok(());
             }
         }
+
+        self.ensure_sidecars_ready();
 
         let Some(source) = self.discover_app_source(id) else {
             return Err(SupervisorError::NotInstalled(id));
@@ -644,7 +904,7 @@ impl Supervisor {
         if let Some(out) = stdout {
             let buf = logs_buf.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(out).lines();
+                let mut lines = TokioBufReader::new(out).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     push_log_line(&buf, line);
                 }
@@ -653,7 +913,7 @@ impl Supervisor {
         if let Some(err) = stderr {
             let buf = logs_buf.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(err).lines();
+                let mut lines = TokioBufReader::new(err).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     push_log_line(&buf, format!("[stderr] {line}"));
                 }
@@ -687,7 +947,12 @@ impl Supervisor {
             }
         });
 
-        // Poll readiness without holding mutex across awaits
+        // Wait 45ms before first HTTP probe so Node/V8 binds its listener without a wasted SYN
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(45)) => {}
+            _ = exited_rx.changed() => {}
+        }
+
         let deadline = Instant::now() + self.config.ready_timeout;
         loop {
             if let Some(reason) = exited_rx.borrow().clone() {
@@ -702,13 +967,16 @@ impl Supervisor {
             }
 
             if let Some(manifest_valid) = self.probe_ready(id, port).await {
-                let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                let slot = guard.slots.get_mut(&id).unwrap();
-                if slot.generation == generation {
-                    slot.state = WorkspaceState::Running;
-                    slot.manifest_valid = manifest_valid;
-                    slot.last_error = None;
+                {
+                    let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    let slot = guard.slots.get_mut(&id).unwrap();
+                    if slot.generation == generation {
+                        slot.state = WorkspaceState::Running;
+                        slot.manifest_valid = manifest_valid;
+                        slot.last_error = None;
+                    }
                 }
+                self.invalidate_vault_cache();
                 return Ok(());
             }
 
@@ -725,7 +993,7 @@ impl Supervisor {
             }
 
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(120)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(35)) => {}
                 _ = exited_rx.changed() => {}
             }
         }
@@ -785,6 +1053,7 @@ impl Supervisor {
             let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if guard.active_target == id.as_str() {
                 guard.active_target = "hub".to_string();
+                guard.prefs.active_target = "hub".to_string();
             }
             let slot = guard.slots.get_mut(&id).unwrap();
             slot.generation += 1;
@@ -826,7 +1095,7 @@ impl Supervisor {
         let installed_targets: Vec<AppId> = targets
             .iter()
             .copied()
-            .filter(|&app| self.discover_app_source(app).is_some())
+            .filter(|&app| self.is_app_installed(app))
             .collect();
 
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -870,7 +1139,33 @@ impl Supervisor {
         drop(held_listeners);
     }
 
+    fn maybe_focus_standalone_primary(&self) {
+        if let Some(primary) = self.config.edition.primary_app() {
+            let should_focus_primary = {
+                let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.active_target == "hub"
+                    && guard.slots[&primary].state == WorkspaceState::Running
+                {
+                    guard.active_target = primary.as_str().to_string();
+                    guard.prefs.active_target = primary.as_str().to_string();
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_focus_primary {
+                let _ = self.vault.update_prefs(PrefsPatch {
+                    active_target: Some(primary.as_str().to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
     pub async fn start_all(self: &Arc<Self>) -> Result<DesktopStatus, SupervisorError> {
+        let sup_unpack = self.clone();
+        let _ = tokio::task::spawn_blocking(move || sup_unpack.ensure_sidecars_ready()).await;
+
         let targets: Vec<AppId> = match self.config.edition.primary_app() {
             Some(primary) => vec![primary],
             None => AppId::ALL.to_vec(),
@@ -889,26 +1184,39 @@ impl Supervisor {
         }
         while set.join_next().await.is_some() {}
 
-        if let Some(primary) = self.config.edition.primary_app() {
-            let should_focus_primary = {
-                let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                if guard.active_target == "hub"
-                    && guard.slots[&primary].state == WorkspaceState::Running
-                {
-                    guard.active_target = primary.as_str().to_string();
-                    true
-                } else {
-                    false
-                }
-            };
-            if should_focus_primary {
-                let _ = self.vault.update_prefs(PrefsPatch {
-                    active_target: Some(primary.as_str().to_string()),
-                    ..Default::default()
-                });
+        self.maybe_focus_standalone_primary();
+        self.invalidate_vault_cache();
+        Ok(self.status())
+    }
+
+    /// Starts bundled workspaces sequentially one-by-one (eliminating the 5-way macOS `amfid`/V8
+    /// cold-boot stampede while keeping UI responsive) and invokes `on_each` after each workspace boots.
+    pub async fn start_all_staggered<F>(
+        self: &Arc<Self>,
+        on_each: F,
+    ) -> Result<DesktopStatus, SupervisorError>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let sup_unpack = self.clone();
+        let _ = tokio::task::spawn_blocking(move || sup_unpack.ensure_sidecars_ready()).await;
+
+        let targets: Vec<AppId> = match self.config.edition.primary_app() {
+            Some(primary) => vec![primary],
+            None => AppId::ALL.to_vec(),
+        };
+
+        self.preallocate_ports(&targets);
+
+        for app in targets {
+            if self.discover_app_source(app).is_some() {
+                let _ = self.start_workspace(app).await;
+                on_each();
             }
         }
 
+        self.maybe_focus_standalone_primary();
+        self.invalidate_vault_cache();
         Ok(self.status())
     }
 
@@ -922,6 +1230,61 @@ impl Supervisor {
         }
         while set.join_next().await.is_some() {}
     }
+}
+
+fn unpack_apps_archive(archive_path: &Path, cache_dir: &Path) -> io::Result<()> {
+    let _ = fs::remove_dir_all(cache_dir);
+    let apps_root = cache_dir.join("apps");
+    fs::create_dir_all(&apps_root)?;
+
+    let file = File::open(archive_path)?;
+    let decoder = GzDecoder::new(BufReader::new(file));
+    let mut archive = Archive::new(decoder);
+
+    for entry_res in archive.entries()? {
+        let mut entry = entry_res?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            continue;
+        }
+
+        let raw_path = entry.path()?.into_owned();
+        let mut normals: Vec<&std::ffi::OsStr> = Vec::new();
+        for comp in raw_path.components() {
+            match comp {
+                Component::Normal(seg) => normals.push(seg),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unsafe path component in apps.tar.gz",
+                    ));
+                }
+            }
+        }
+        if normals.is_empty() {
+            continue;
+        }
+
+        let mut out_path = if normals[0] == "apps" {
+            cache_dir.to_path_buf()
+        } else {
+            apps_root.clone()
+        };
+        for seg in normals {
+            out_path.push(seg);
+        }
+
+        if entry_type.is_dir() {
+            fs::create_dir_all(&out_path)?;
+        } else if entry_type.is_file() {
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            entry.unpack(&out_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn push_log_line(buf: &Arc<Mutex<VecDeque<String>>>, line: String) {

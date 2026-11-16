@@ -2,6 +2,7 @@ use crate::edition::{is_valid_target, AppId};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{backup::Backup, params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -160,38 +161,12 @@ impl Vault {
 
     /// Reads `<vault_root>/pr/api-token`, returning it only if it is a valid 64-char ASCII hex secret.
     pub fn read_pr_api_token(&self) -> Option<String> {
-        let token_path = self.root_dir.join(AppId::Pr.as_str()).join("api-token");
-        let raw = fs::read_to_string(token_path).ok()?;
-        let trimmed = raw.trim();
-        if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
-            Some(trimmed.to_ascii_lowercase())
-        } else {
-            None
-        }
+        read_pr_api_token_at_root(&self.root_dir)
     }
 
     /// Ensures `<vault_root>/pr/api-token` exists with a 64-char CSPRNG lowercase hex secret (`0600` on Unix).
     pub fn ensure_pr_api_token(&self) -> Result<String, VaultError> {
-        if let Some(existing) = self.read_pr_api_token() {
-            return Ok(existing);
-        }
-        let pr_dir = self.root_dir.join(AppId::Pr.as_str());
-        fs::create_dir_all(&pr_dir)?;
-        let token_path = pr_dir.join("api-token");
-        let tok: String = {
-            let _guard = self.prefs_lock.lock().unwrap_or_else(|e| e.into_inner());
-            let conn = self.open_prefs_conn()?;
-            conn.query_row("SELECT lower(hex(randomblob(32)))", [], |r| r.get(0))?
-        };
-        let tmp_path = pr_dir.join("api-token.tmp-init");
-        fs::write(&tmp_path, format!("{tok}\n"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
-        }
-        fs::rename(&tmp_path, &token_path)?;
-        Ok(tok)
+        Ok(ensure_pr_api_token_at_root(&self.root_dir)?)
     }
 
     /// Ensures `<vault_root>/pr/state.json` exists on fresh startup unless prior `state.json.bak.*` files exist.
@@ -331,6 +306,51 @@ impl Vault {
             ],
         )?;
         Ok(current)
+    }
+
+    /// Fast O(files) metadata-only scan without opening any SQLite connection or running `PRAGMA quick_check`.
+    pub fn scan_fast(&self) -> VaultStatus {
+        let mut databases = Vec::new();
+        for app in AppId::ALL {
+            let app_dir = self.root_dir.join(app.as_str());
+            let mut found_paths = Vec::new();
+            collect_sqlite_files(&app_dir, 1, 3, &mut found_paths);
+            found_paths.sort();
+            for path in found_paths {
+                let bytes = sqlite_total_bytes(&path);
+                databases.push(VaultDatabase {
+                    app_id: app,
+                    path: path.to_string_lossy().into_owned(),
+                    bytes,
+                    healthy: true,
+                    tables: 0,
+                });
+            }
+            if app == AppId::Pr {
+                for json_path in collect_pr_json_stores(&app_dir) {
+                    let bytes = fs::metadata(&json_path).map(|m| m.len()).unwrap_or(0);
+                    databases.push(VaultDatabase {
+                        app_id: AppId::Pr,
+                        path: json_path.to_string_lossy().into_owned(),
+                        bytes,
+                        healthy: bytes > 0,
+                        tables: usize::from(bytes > 0),
+                    });
+                }
+            }
+        }
+
+        let total_bytes = databases.iter().map(|d| d.bytes).sum();
+        let (backups_count, last_backup_at) = self.scan_backups();
+
+        VaultStatus {
+            root_dir: self.root_dir.to_string_lossy().into_owned(),
+            total_bytes,
+            quota_bytes: DEFAULT_VAULT_QUOTA_BYTES,
+            backups_count,
+            last_backup_at,
+            databases,
+        }
     }
 
     pub fn scan(&self) -> VaultStatus {
@@ -561,6 +581,44 @@ fn inspect_sqlite_db(path: &Path) -> (bool, usize) {
         .unwrap_or(0);
 
     (healthy, tables)
+}
+
+pub fn read_pr_api_token_at_root(vault_root: &Path) -> Option<String> {
+    let token_path = vault_root.join(AppId::Pr.as_str()).join("api-token");
+    let raw = fs::read_to_string(token_path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(trimmed.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Ensures `<vault_root>/pr/api-token` exists using OS CSPRNG without opening SQLite.
+pub fn ensure_pr_api_token_at_root(vault_root: &Path) -> std::io::Result<String> {
+    if let Some(existing) = read_pr_api_token_at_root(vault_root) {
+        return Ok(existing);
+    }
+    let pr_dir = vault_root.join(AppId::Pr.as_str());
+    fs::create_dir_all(&pr_dir)?;
+    let token_path = pr_dir.join("api-token");
+
+    let mut random_bytes = [0u8; 32];
+    getrandom::getrandom(&mut random_bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut tok = String::with_capacity(64);
+    for b in random_bytes {
+        let _ = write!(tok, "{b:02x}");
+    }
+
+    let tmp_path = pr_dir.join(format!("api-token.tmp-{}", std::process::id()));
+    fs::write(&tmp_path, format!("{tok}\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(&tmp_path, &token_path)?;
+    Ok(tok)
 }
 
 fn collect_pr_json_stores(pr_dir: &Path) -> Vec<PathBuf> {
