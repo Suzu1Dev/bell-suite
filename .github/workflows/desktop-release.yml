@@ -36,7 +36,23 @@ jobs:
   prepare-bundles:
     name: Bundle & Verify 5 Sidecars + UI Shell
     runs-on: ubuntu-latest
+    outputs:
+      editions: ${{ steps.matrix.outputs.editions }}
     steps:
+      - name: Resolve target editions matrix
+        id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_EDITION: ${{ inputs.edition }}
+        run: |
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            echo 'editions=["suite"]' >> "${GITHUB_OUTPUT}"
+          elif [ -n "${INPUT_EDITION:-}" ] && [ "${INPUT_EDITION}" != "all" ]; then
+            printf 'editions=["%s"]\n' "${INPUT_EDITION}" >> "${GITHUB_OUTPUT}"
+          else
+            echo 'editions=["suite","personal","explain","pr","reader","campaign"]' >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Checkout bell-suite
         uses: actions/checkout@v4
         with:
@@ -185,22 +201,14 @@ jobs:
     if: >-
       always() &&
       needs.prepare-bundles.result == 'success' &&
-      (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') &&
-      (github.event.inputs.edition == '' || github.event.inputs.edition == 'all' || github.event.inputs.edition == matrix.edition) &&
-      (github.event_name != 'pull_request' || matrix.edition == 'suite')
+      (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     runs-on: ${{ matrix.platform.os }}
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
-        edition:
-          - suite
-          - personal
-          - explain
-          - pr
-          - reader
-          - campaign
+        edition: ${{ fromJSON(needs.prepare-bundles.outputs.editions) }}
         platform:
           - os: macos-latest
             os_label: macos-universal
