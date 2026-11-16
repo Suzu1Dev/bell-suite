@@ -15,6 +15,6 @@ tauri-build = { version = "2", features = [] }
 bell-core = { path = "../bell-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2", features = ["unstable", "tray-icon"] }
+tauri = { version = "2", features = ["unstable", "tray-icon", "devtools"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 url = "2"

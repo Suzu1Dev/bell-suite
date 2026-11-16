@@ -8,6 +8,7 @@ import {
   getTodayOverview,
   getWorkspaceLogs,
   isTauriRuntime,
+  reportDesktopReady,
   resolveChromePlatform,
   sanitizeRoute,
   savePrefs,
@@ -1206,6 +1207,23 @@ async function refreshStageLogsIfNeeded(): Promise<void> {
   }
 }
 
+let reportedReadyOnce = false;
+
+function notifyHostRenderReady(): void {
+  if (!isTauri || reportedReadyOnce || !state.status) return;
+  const chromeHeight = Math.round(chromeMount.getBoundingClientRect().height);
+  const mainHeight = Math.round(mainMount.getBoundingClientRect().height);
+  const textLength = (document.body.innerText || "").trim().length;
+  if (chromeHeight <= 0 || textLength <= 0) return;
+  reportedReadyOnce = true;
+  void reportDesktopReady({
+    chromeHeight,
+    mainHeight,
+    textLength,
+    theme: document.documentElement.dataset.theme || "light",
+  });
+}
+
 async function loadInitial(): Promise<void> {
   try {
     const [status, today] = await Promise.all([
@@ -1216,6 +1234,8 @@ async function loadInitial(): Promise<void> {
     if (today) state.today = today;
     state.error = null;
     render();
+    requestAnimationFrame(() => notifyHostRenderReady());
+    window.setTimeout(() => notifyHostRenderReady(), 40);
     await refreshStageLogsIfNeeded();
   } catch (err) {
     state.error = err instanceof Error ? err.message : String(err);

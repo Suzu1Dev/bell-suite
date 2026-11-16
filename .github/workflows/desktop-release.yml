@@ -286,11 +286,11 @@ jobs:
           chmod 0755 desktop/dist-sidecars/bin/bell-runtime
           if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
             codesign --force --sign "${APPLE_SIGNING_IDENTITY}" --timestamp --options runtime \
-              --entitlements desktop/editions/entitlements.macos.plist \
+              --entitlements desktop/editions/entitlements.runtime.macos.plist \
               desktop/dist-sidecars/bin/bell-runtime
           else
             codesign --force --sign - --timestamp=none \
-              --entitlements desktop/editions/entitlements.macos.plist \
+              --entitlements desktop/editions/entitlements.runtime.macos.plist \
               desktop/dist-sidecars/bin/bell-runtime
           fi
 
@@ -333,6 +333,8 @@ jobs:
           }
 
       - name: Generate icons & stage edition config (${{ matrix.edition }})
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
         run: |
           node desktop/scripts/generate-icons.mjs
           node desktop/scripts/prepare-edition.mjs ${{ matrix.edition }} --stage-resources --apply
@@ -349,8 +351,8 @@ jobs:
             echo "has_cert=false" >> "${GITHUB_OUTPUT}"
           fi
 
-      - name: Build Tauri v2 installer (PR / Dispatch)
-        if: ${{ needs.create-release.outputs.release_id == '' }}
+      - name: Build Tauri v2 installer (Unsigned / Ad-hoc Preview)
+        if: ${{ steps.apple_cert.outputs.has_cert != 'true' }}
         uses: tauri-apps/tauri-action@v0
         env:
           BELL_DESKTOP_EDITION: ${{ matrix.edition }}
@@ -362,22 +364,8 @@ jobs:
           includeUpdaterJson: false
           args: ${{ matrix.platform.tauri_args }}
 
-      - name: Build & Upload Tauri v2 Release Assets (Tag — Unsigned / Ad-hoc Preview)
-        if: ${{ needs.create-release.outputs.release_id != '' && steps.apple_cert.outputs.has_cert != 'true' }}
-        uses: tauri-apps/tauri-action@v0
-        env:
-          BELL_DESKTOP_EDITION: ${{ matrix.edition }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
-        with:
-          projectPath: desktop/crates/bell-tauri
-          tauriScript: tauri
-          includeUpdaterJson: false
-          args: ${{ matrix.platform.tauri_args }}
-          releaseId: ${{ needs.create-release.outputs.release_id }}
-
-      - name: Build & Upload Tauri v2 Release Assets (Tag — Developer ID Signed & Notarized)
-        if: ${{ needs.create-release.outputs.release_id != '' && steps.apple_cert.outputs.has_cert == 'true' }}
+      - name: Build Tauri v2 installer (Developer ID Signed & Notarized)
+        if: ${{ steps.apple_cert.outputs.has_cert == 'true' }}
         uses: tauri-apps/tauri-action@v0
         env:
           BELL_DESKTOP_EDITION: ${{ matrix.edition }}
@@ -393,7 +381,98 @@ jobs:
           tauriScript: tauri
           includeUpdaterJson: false
           args: ${{ matrix.platform.tauri_args }}
-          releaseId: ${{ needs.create-release.outputs.release_id }}
+
+      - name: Verify real macOS .app WKWebView render & sidecar boot (${{ matrix.edition }})
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          HAS_APPLE_CERT: ${{ steps.apple_cert.outputs.has_cert }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=(desktop/target/universal-apple-darwin/release/bundle/macos/*.app)
+          if [ "${#apps[@]}" -ne 1 ]; then
+            echo "Expected exactly 1 .app bundle, found ${#apps[@]}" >&2
+            exit 1
+          fi
+          APP_BUNDLE="${apps[0]}"
+          APP_BIN="${APP_BUNDLE}/Contents/MacOS/bell-desktop"
+
+          echo "=== Inspecting code signature for ${APP_BIN} ==="
+          codesign -dvvv "${APP_BIN}" 2>&1 | tee /tmp/bell-codesign.txt
+          if [ "${HAS_APPLE_CERT}" != "true" ] && grep -Eq "flags=0x[0-9a-fA-F]*\\(.*runtime" /tmp/bell-codesign.txt; then
+            echo "ERROR: Ad-hoc build must NOT carry CS_RUNTIME (Hardened Runtime) flag!" >&2
+            exit 1
+          fi
+
+          SELFTEST_JSON="$(mktemp /tmp/bell-selftest-XXXXXX.json)"
+          VAULT_TMP="$(mktemp -d)"
+          trap 'rm -rf "${VAULT_TMP}"' EXIT
+
+          echo "=== Launching ${APP_BUNDLE} for live WKWebView + sidecar verification ==="
+          BELL_DESKTOP_EDITION="${{ matrix.edition }}" \
+          BELL_DESKTOP_VAULT_DIR="${VAULT_TMP}" \
+          BELL_DESKTOP_SELFTEST_OUT="${SELFTEST_JSON}" \
+            "${APP_BIN}"
+
+          cat "${SELFTEST_JSON}"
+          node --input-type=module - "${SELFTEST_JSON}" <<'EOF'
+          import fs from "node:fs";
+          const report = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          if (!report.ok) {
+            throw new Error(`macOS runtime self-test failed: ${JSON.stringify(report)}`);
+          }
+          if (!report.domReady || report.domReady.chromeHeight < 36 || report.domReady.textLength < 10) {
+            throw new Error(`WKWebView failed to render visible DOM: ${JSON.stringify(report.domReady)}`);
+          }
+          if (report.installedWorkspaces < 1 || report.healthyRunningWorkspaces !== report.installedWorkspaces) {
+            throw new Error(`Bundled sidecars unhealthy: ${report.healthyRunningWorkspaces}/${report.installedWorkspaces}`);
+          }
+          console.log(
+            `VERIFIED macOS WKWebView render (${report.edition}): chromeHeight=${report.domReady.chromeHeight}px, mainHeight=${report.domReady.mainHeight}px, textLength=${report.domReady.textLength}, sidecars=${report.healthyRunningWorkspaces}/${report.installedWorkspaces}`,
+          );
+          EOF
+
+          BUNDLE_DIR="$(dirname "${APP_BUNDLE}")"
+          APP_BASE="$(basename "${APP_BUNDLE}" .app)"
+          DOT_SLUG="$(printf '%s' "${APP_BASE}" | tr ' ' '.')"
+          COPYFILE_DISABLE=1 tar -czf "${BUNDLE_DIR}/${DOT_SLUG}_universal.app.tar.gz" \
+            -C "${BUNDLE_DIR}" "$(basename "${APP_BUNDLE}")"
+
+      - name: Upload verified macOS installers to GitHub Release
+        if: ${{ runner.os == 'macOS' && needs.create-release.outputs.release_id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          shopt -s nullglob
+          files=(
+            desktop/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            desktop/target/universal-apple-darwin/release/bundle/macos/*_universal.app.tar.gz
+          )
+          if [ "${#files[@]}" -lt 2 ]; then
+            echo "Missing expected macOS release assets: ${files[*]}" >&2
+            exit 1
+          fi
+          gh release upload "${TAG_NAME}" "${files[@]}" --clobber
+
+      - name: Upload verified Windows installers to GitHub Release
+        if: ${{ runner.os == 'Windows' && needs.create-release.outputs.release_id != '' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tagName = $env:GITHUB_REF -replace '^refs/tags/', ''
+          $msiFiles = @(Get-ChildItem -Path "desktop\target\x86_64-pc-windows-msvc\release\bundle\msi\*.msi")
+          $nsisFiles = @(Get-ChildItem -Path "desktop\target\x86_64-pc-windows-msvc\release\bundle\nsis\*-setup.exe")
+          $allFiles = @($msiFiles + $nsisFiles) | ForEach-Object { $_.FullName }
+          if ($allFiles.Count -lt 2) {
+            throw "Missing expected Windows release assets ($($allFiles.Count) found)"
+          }
+          gh release upload $tagName @allFiles --clobber
 
       - name: Upload installer artifacts (${{ matrix.edition }} - ${{ matrix.platform.os_label }})
         uses: actions/upload-artifact@v4

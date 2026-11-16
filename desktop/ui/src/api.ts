@@ -467,3 +467,17 @@ export async function windowAction(action: WindowAction): Promise<void> {
     await tauri.invoke<void>("desktop_window_action", { action });
   }
 }
+
+export interface DesktopRenderReport {
+  chromeHeight: number;
+  mainHeight: number;
+  textLength: number;
+  theme: string;
+}
+
+export async function reportDesktopReady(report: DesktopRenderReport): Promise<void> {
+  const tauri = getTauriInternals();
+  if (tauri) {
+    await tauri.invoke<void>("desktop_report_ready", { report }).catch(() => {});
+  }
+}

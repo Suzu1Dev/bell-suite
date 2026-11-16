@@ -4,13 +4,19 @@ use bell_core::{
     AppId, DesktopStatus, Edition, PrefsPatch, Supervisor, SupervisorConfig, TodayOverview,
     VaultBackupResult, WorkspaceLogs, WorkspaceState,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use tauri::{
     menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder, Submenu, SubmenuBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, LogicalPosition, LogicalSize, Manager, RunEvent, State, WebviewUrl, WindowEvent,
-    Wry,
+    window::Color,
+    AppHandle, LogicalPosition, LogicalSize, Manager, Rect, RunEvent, State, WebviewUrl,
+    WindowEvent, Wry,
 };
 use url::Url;
 
@@ -20,9 +26,41 @@ const DEFAULT_HEIGHT: f64 = 860.0;
 const MIN_WIDTH: f64 = 900.0;
 const MIN_HEIGHT: f64 = 620.0;
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopRenderReport {
+    chrome_height: u32,
+    main_height: u32,
+    text_length: usize,
+    theme: String,
+}
+
+struct SelftestCoordinator {
+    out_path: PathBuf,
+    dom_report: Mutex<Option<DesktopRenderReport>>,
+    autostart_done: AtomicBool,
+    finished: AtomicBool,
+}
+
 struct AppState {
     supervisor: Arc<Supervisor>,
     webview_ports: Mutex<BTreeMap<AppId, u16>>,
+    selftest: Option<Arc<SelftestCoordinator>>,
+}
+
+fn surface_color_for_theme(theme_pref: &str) -> Color {
+    if theme_pref.eq_ignore_ascii_case("dark") {
+        Color(19, 20, 23, 255)
+    } else {
+        Color(247, 245, 240, 255)
+    }
+}
+
+fn set_webview_rect(wv: &tauri::Webview, x: f64, y: f64, width: f64, height: f64) {
+    let _ = wv.set_bounds(Rect {
+        position: LogicalPosition::new(x, y).into(),
+        size: LogicalSize::new(width.max(1.0), height.max(1.0)).into(),
+    });
 }
 
 fn window_logical_size(window: &tauri::Window) -> (f64, f64) {
@@ -74,16 +112,13 @@ fn resize_webview_bounds(app: &AppHandle) {
         });
 
     if let Some(target_id) = active_running {
-        let _ = chrome.set_position(LogicalPosition::new(0.0, 0.0));
-        let _ = chrome.set_size(LogicalSize::new(width, CHROME_BAR_HEIGHT));
+        set_webview_rect(&chrome, 0.0, 0.0, width, CHROME_BAR_HEIGHT);
         if let Some(wv) = app.get_webview(&format!("ws-{}", target_id.as_str())) {
             let ws_height = (height - CHROME_BAR_HEIGHT).max(100.0);
-            let _ = wv.set_position(LogicalPosition::new(0.0, CHROME_BAR_HEIGHT));
-            let _ = wv.set_size(LogicalSize::new(width, ws_height));
+            set_webview_rect(&wv, 0.0, CHROME_BAR_HEIGHT, width, ws_height);
         }
     } else {
-        let _ = chrome.set_position(LogicalPosition::new(0.0, 0.0));
-        let _ = chrome.set_size(LogicalSize::new(width, height));
+        set_webview_rect(&chrome, 0.0, 0.0, width, height);
     }
 }
 
@@ -100,6 +135,7 @@ fn sync_webview_layout(app: &AppHandle, route: Option<&str>) {
 
     let (width, height) = window_logical_size(&window);
     let status = state.supervisor.status();
+    let bg = surface_color_for_theme(&status.prefs.theme);
 
     let active_running = status
         .active_target
@@ -122,8 +158,7 @@ fn sync_webview_layout(app: &AppHandle, route: Option<&str>) {
             }
         }
 
-        let _ = chrome.set_position(LogicalPosition::new(0.0, 0.0));
-        let _ = chrome.set_size(LogicalSize::new(width, CHROME_BAR_HEIGHT));
+        set_webview_rect(&chrome, 0.0, 0.0, width, CHROME_BAR_HEIGHT);
 
         let ws_height = (height - CHROME_BAR_HEIGHT).max(100.0);
         let hash_suffix = match route {
@@ -170,12 +205,12 @@ fn sync_webview_layout(app: &AppHandle, route: Option<&str>) {
                 }
             }
 
-            let _ = wv.set_position(LogicalPosition::new(0.0, CHROME_BAR_HEIGHT));
-            let _ = wv.set_size(LogicalSize::new(width, ws_height));
+            set_webview_rect(&wv, 0.0, CHROME_BAR_HEIGHT, width, ws_height);
             let _ = wv.show();
         } else if let Ok(parsed) = Url::parse(&full_url_str) {
             let mut builder =
-                tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed));
+                tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
+                    .background_color(bg);
             if target_id == AppId::Pr {
                 if let Some(tok) = state.supervisor.pr_api_token() {
                     builder = builder.initialization_script(pr_token_init_script(&tok));
@@ -202,11 +237,79 @@ fn sync_webview_layout(app: &AppHandle, route: Option<&str>) {
                 let _ = wv.hide();
             }
         }
-        let _ = chrome.set_position(LogicalPosition::new(0.0, 0.0));
-        let _ = chrome.set_size(LogicalSize::new(width, height));
+        set_webview_rect(&chrome, 0.0, 0.0, width, height);
     }
 
     let _ = chrome.eval("window.dispatchEvent(new CustomEvent('bell:sync'))");
+}
+
+fn try_complete_selftest(app: &AppHandle, force_timeout: bool) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let Some(selftest) = state.selftest.clone() else {
+        return;
+    };
+
+    let dom_opt = selftest
+        .dom_report
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let autostart_done = selftest.autostart_done.load(Ordering::SeqCst);
+
+    if !force_timeout && (dom_opt.is_none() || !autostart_done) {
+        return;
+    }
+    if selftest.finished.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let status = state.supervisor.status();
+    let installed_count = status.workspaces.iter().filter(|w| w.installed).count();
+    let healthy_running_count = status
+        .workspaces
+        .iter()
+        .filter(|w| w.installed && w.state == WorkspaceState::Running && w.manifest_valid)
+        .count();
+
+    let dom_ok = dom_opt
+        .as_ref()
+        .is_some_and(|d| d.chrome_height >= 36 && d.text_length >= 10);
+    let sidecars_ok = installed_count > 0 && healthy_running_count == installed_count;
+    let all_ok = dom_ok && sidecars_ok && !force_timeout;
+
+    let payload = serde_json::json!({
+        "ok": all_ok,
+        "timedOut": force_timeout,
+        "edition": status.edition,
+        "version": status.version,
+        "os": status.os,
+        "arch": status.arch,
+        "domReady": dom_opt,
+        "autostartDone": autostart_done,
+        "installedWorkspaces": installed_count,
+        "healthyRunningWorkspaces": healthy_running_count,
+        "workspaces": status.workspaces,
+    });
+
+    let out_path = selftest.out_path.clone();
+    let sup = state.supervisor.clone();
+    let handle = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        if let Some(parent) = out_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(serialized) = serde_json::to_string_pretty(&payload) {
+            let _ = std::fs::write(&out_path, format!("{serialized}\n"));
+        }
+        sup.shutdown_all().await;
+        let code = if all_ok { 0 } else { 1 };
+        handle.exit(code);
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        std::process::exit(code);
+    });
 }
 
 #[tauri::command]
@@ -267,12 +370,13 @@ async fn desktop_start_all(
 
 #[tauri::command]
 async fn desktop_save_prefs(
+    app: AppHandle,
     state: State<'_, AppState>,
     theme: Option<String>,
     lang: Option<String>,
     auto_start: Option<bool>,
 ) -> Result<DesktopStatus, String> {
-    state
+    let updated = state
         .supervisor
         .save_prefs(PrefsPatch {
             theme,
@@ -280,7 +384,16 @@ async fn desktop_save_prefs(
             active_target: None,
             auto_start,
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    let bg = surface_color_for_theme(&updated.prefs.theme);
+    if let Some(window) = app.get_window("main") {
+        let _ = window.set_background_color(Some(bg));
+    }
+    if let Some(chrome) = app.get_webview("chrome") {
+        let _ = chrome.set_background_color(Some(bg));
+    }
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -311,6 +424,22 @@ async fn desktop_window_action(app: AppHandle, action: String) -> Result<(), Str
         "close" => window.close().map_err(|e| e.to_string()),
         other => Err(format!("unknown window action '{other}'")),
     }
+}
+
+#[tauri::command]
+async fn desktop_report_ready(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    report: DesktopRenderReport,
+) -> Result<(), String> {
+    if let Some(ref selftest) = state.selftest {
+        *selftest
+            .dom_report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(report);
+        try_complete_selftest(&app, false);
+    }
+    Ok(())
 }
 
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -438,8 +567,20 @@ fn setup_app_menu(app: &tauri::App, _title: &str) -> Result<(), Box<dyn std::err
 
 fn main() {
     let edition = Edition::active();
+    let selftest_out = std::env::var("BELL_DESKTOP_SELFTEST_OUT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_web_content_process_terminate(|webview| {
+        let _ = webview.reload();
+    });
+
+    let app = builder
         .on_menu_event(|app_handle, event| {
             if let Some(target) = event.id().as_ref().strip_prefix("nav:") {
                 let app_bg = app_handle.clone();
@@ -477,18 +618,35 @@ fn main() {
                 ..Default::default()
             })?;
 
+            let selftest = selftest_out.map(|out_path| {
+                Arc::new(SelftestCoordinator {
+                    out_path,
+                    dom_report: Mutex::new(None),
+                    autostart_done: AtomicBool::new(false),
+                    finished: AtomicBool::new(false),
+                })
+            });
+
             app.manage(AppState {
                 supervisor: supervisor.clone(),
                 webview_ports: Mutex::new(BTreeMap::new()),
+                selftest: selftest.clone(),
             });
 
             setup_app_menu(app, edition.display_name())?;
             setup_tray(app)?;
 
+            let initial_status = supervisor.status();
+            let initial_bg = surface_color_for_theme(&initial_status.prefs.theme);
+
             let mut win_builder = tauri::window::WindowBuilder::new(app, "main")
                 .title(edition.display_name())
                 .inner_size(DEFAULT_WIDTH, DEFAULT_HEIGHT)
-                .min_inner_size(MIN_WIDTH, MIN_HEIGHT);
+                .min_inner_size(MIN_WIDTH, MIN_HEIGHT)
+                .prevent_overflow()
+                .center()
+                .visible(false)
+                .background_color(initial_bg);
 
             #[cfg(target_os = "macos")]
             {
@@ -509,15 +667,20 @@ fn main() {
                 let _ = window.hide_menu();
             }
 
-            let chrome_builder = tauri::webview::WebviewBuilder::new(
-                "chrome",
-                WebviewUrl::App("index.html".into()),
-            );
+            let (init_w, init_h) = window_logical_size(&window);
+            let chrome_builder =
+                tauri::webview::WebviewBuilder::new("chrome", WebviewUrl::App("index.html".into()))
+                    .background_color(initial_bg);
+
             window.add_child(
                 chrome_builder,
                 LogicalPosition::new(0.0, 0.0),
-                LogicalSize::new(DEFAULT_WIDTH, DEFAULT_HEIGHT),
+                LogicalSize::new(init_w, init_h),
             )?;
+
+            let _ = window.show();
+            let _ = window.set_focus();
+            resize_webview_bounds(app.handle());
 
             let handle_for_resize = app.handle().clone();
             window.on_window_event(move |event| {
@@ -529,12 +692,28 @@ fn main() {
                 }
             });
 
-            if supervisor.status().prefs.auto_start {
+            let should_start = initial_status.prefs.auto_start || selftest.is_some();
+            if should_start {
                 let sup_bg = supervisor.clone();
                 let handle_bg = app.handle().clone();
+                let selftest_bg = selftest.clone();
                 tauri::async_runtime::spawn(async move {
                     let _ = sup_bg.start_all().await;
                     sync_webview_layout(&handle_bg, None);
+                    if let Some(st) = selftest_bg {
+                        st.autostart_done.store(true, Ordering::SeqCst);
+                        try_complete_selftest(&handle_bg, false);
+                    }
+                });
+            } else if let Some(ref st) = selftest {
+                st.autostart_done.store(true, Ordering::SeqCst);
+            }
+
+            if selftest.is_some() {
+                let watchdog_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+                    try_complete_selftest(&watchdog_handle, true);
                 });
             }
 
@@ -550,6 +729,7 @@ fn main() {
             desktop_vault_backup,
             desktop_logs,
             desktop_window_action,
+            desktop_report_ready,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build BELL Desktop application");

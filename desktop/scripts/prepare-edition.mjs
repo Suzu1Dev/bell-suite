@@ -14,9 +14,11 @@ const TAURI_CONF_PATH = path.join(TAURI_CRATE_DIR, "tauri.conf.json");
 const TAURI_ICONS_DIR = path.join(TAURI_CRATE_DIR, "icons");
 
 const SUITE_PKG = JSON.parse(readFileSync(path.join(SUITE_ROOT, "package.json"), "utf8"));
+const UI_PKG = JSON.parse(readFileSync(path.join(DESKTOP_DIR, "ui", "package.json"), "utf8"));
+const DESKTOP_VERSION = UI_PKG.version || SUITE_PKG.version;
 
 export const DEFAULT_CSP =
-  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:*; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
+  "default-src 'self' tauri: http://tauri.localhost https://tauri.localhost; script-src 'self' tauri: http://tauri.localhost https://tauri.localhost; style-src 'self' 'unsafe-inline' tauri: http://tauri.localhost https://tauri.localhost; img-src 'self' tauri: http://tauri.localhost https://tauri.localhost asset: http://asset.localhost https://asset.localhost data: blob:; font-src 'self' tauri: http://tauri.localhost https://tauri.localhost data:; connect-src 'self' tauri: http://tauri.localhost https://tauri.localhost ipc: ipc://localhost http://ipc.localhost https://ipc.localhost http://127.0.0.1:*; object-src 'none'; base-uri 'self'; form-action 'self'";
 
 export const EDITION_SPECS = {
   suite: {
@@ -101,13 +103,20 @@ function stageResourcesForEdition(spec) {
 
   writeFileSync(
     path.join(stagedSidecars, "edition.json"),
-    JSON.stringify({ edition: spec.id, version: SUITE_PKG.version }, null, 2) + "\n",
+    JSON.stringify({ edition: spec.id, version: DESKTOP_VERSION }, null, 2) + "\n",
   );
 
   return `../../editions/.staged/${spec.id}/dist-sidecars`;
 }
 
-export function buildTauriConfig(spec, { resourceSource = "../../dist-sidecars", baseConfig = null } = {}) {
+export function buildTauriConfig(
+  spec,
+  {
+    resourceSource = "../../dist-sidecars",
+    baseConfig = null,
+    hasDeveloperIdCert = Boolean(process.env.APPLE_CERTIFICATE && process.env.APPLE_CERTIFICATE.trim()),
+  } = {},
+) {
   const baseWindows = Array.isArray(baseConfig?.app?.windows) && baseConfig.app.windows.length > 0
     ? baseConfig.app.windows[0]
     : {};
@@ -117,7 +126,7 @@ export function buildTauriConfig(spec, { resourceSource = "../../dist-sidecars",
     ...(baseConfig ?? {}),
     productName: spec.productName,
     mainBinaryName: "bell-desktop",
-    version: SUITE_PKG.version,
+    version: DESKTOP_VERSION,
     identifier: spec.identifier,
     build: {
       frontendDist: "../../ui/dist",
@@ -163,7 +172,11 @@ export function buildTauriConfig(spec, { resourceSource = "../../dist-sidecars",
       macOS: {
         ...(baseConfig?.bundle?.macOS ?? {}),
         minimumSystemVersion: "12.0",
-        entitlements: "../../editions/entitlements.macos.plist",
+        // Ad-hoc signed macOS builds (`APPLE_SIGNING_IDENTITY="-"`) must NOT set CS_RUNTIME
+        // (`hardenedRuntime: true`), otherwise WKWebView WebContent/GPU XPC fails to attach
+        // and leaves TaoView's uninitialized black OpenGL layer visible.
+        hardenedRuntime: hasDeveloperIdCert,
+        entitlements: hasDeveloperIdCert ? "../../editions/entitlements.macos.plist" : null,
       },
       windows: {
         ...(baseConfig?.bundle?.windows ?? {}),
