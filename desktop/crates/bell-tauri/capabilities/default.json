@@ -1,14 +1,9 @@
 {
   "identifier": "default",
-  "description": "Least-privilege capabilities restricted strictly to the chrome webview",
-  "webviews": ["chrome"],
+  "description": "Capabilities for the local BELL Hub window (never granted to remote 127.0.0.1 workspace origins)",
+  "windows": ["main"],
   "permissions": [
     "core:default",
-    "core:window:default",
-    "core:window:allow-minimize",
-    "core:window:allow-toggle-maximize",
-    "core:window:allow-close",
-    "core:window:allow-start-dragging",
-    "core:webview:default"
+    "core:window:default"
   ]
 }

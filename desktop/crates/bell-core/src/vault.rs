@@ -170,6 +170,30 @@ impl Vault {
         }
     }
 
+    /// Ensures `<vault_root>/pr/api-token` exists with a 64-char CSPRNG lowercase hex secret (`0600` on Unix).
+    pub fn ensure_pr_api_token(&self) -> Result<String, VaultError> {
+        if let Some(existing) = self.read_pr_api_token() {
+            return Ok(existing);
+        }
+        let pr_dir = self.root_dir.join(AppId::Pr.as_str());
+        fs::create_dir_all(&pr_dir)?;
+        let token_path = pr_dir.join("api-token");
+        let tok: String = {
+            let _guard = self.prefs_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let conn = self.open_prefs_conn()?;
+            conn.query_row("SELECT lower(hex(randomblob(32)))", [], |r| r.get(0))?
+        };
+        let tmp_path = pr_dir.join("api-token.tmp-init");
+        fs::write(&tmp_path, format!("{tok}\n"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        }
+        fs::rename(&tmp_path, &token_path)?;
+        Ok(tok)
+    }
+
     /// Ensures `<vault_root>/pr/state.json` exists on fresh startup unless prior `state.json.bak.*` files exist.
     pub fn ensure_pr_initial_store(&self) -> Result<(), VaultError> {
         let pr_dir = self.root_dir.join(AppId::Pr.as_str());

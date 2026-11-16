@@ -14,8 +14,18 @@ const TAURI_CONF_PATH = path.join(TAURI_CRATE_DIR, "tauri.conf.json");
 const TAURI_ICONS_DIR = path.join(TAURI_CRATE_DIR, "icons");
 
 const SUITE_PKG = JSON.parse(readFileSync(path.join(SUITE_ROOT, "package.json"), "utf8"));
-const UI_PKG = JSON.parse(readFileSync(path.join(DESKTOP_DIR, "ui", "package.json"), "utf8"));
-const DESKTOP_VERSION = UI_PKG.version || SUITE_PKG.version;
+
+function readDesktopVersion() {
+  try {
+    const cargoToml = readFileSync(path.join(DESKTOP_DIR, "Cargo.toml"), "utf8");
+    const section = cargoToml.match(/\[workspace\.package\]([\s\S]*?)(?:\n\[|$)/);
+    const ver = (section ? section[1] : cargoToml).match(/^\s*version\s*=\s*"([^"]+)"/m);
+    if (ver?.[1]) return ver[1].trim();
+  } catch {}
+  return SUITE_PKG.version;
+}
+
+export const DESKTOP_VERSION = readDesktopVersion();
 
 export const DEFAULT_CSP =
   "default-src 'self' tauri: http://tauri.localhost https://tauri.localhost; script-src 'self' tauri: http://tauri.localhost https://tauri.localhost; style-src 'self' 'unsafe-inline' tauri: http://tauri.localhost https://tauri.localhost; img-src 'self' tauri: http://tauri.localhost https://tauri.localhost asset: http://asset.localhost https://asset.localhost data: blob:; font-src 'self' tauri: http://tauri.localhost https://tauri.localhost data:; connect-src 'self' tauri: http://tauri.localhost https://tauri.localhost ipc: ipc://localhost http://ipc.localhost https://ipc.localhost http://127.0.0.1:*; object-src 'none'; base-uri 'self'; form-action 'self'";
@@ -129,9 +139,9 @@ export function buildTauriConfig(
     version: DESKTOP_VERSION,
     identifier: spec.identifier,
     build: {
-      frontendDist: "../../ui/dist",
-      devUrl: "http://127.0.0.1:5173",
       ...(baseConfig?.build ?? {}),
+      frontendDist: "../../hub-dist",
+      devUrl: "http://127.0.0.1:4600",
     },
     app: {
       ...(baseConfig?.app ?? {}),
@@ -175,8 +185,8 @@ export function buildTauriConfig(
         // Ad-hoc signed macOS builds (`APPLE_SIGNING_IDENTITY="-"`) must NOT set CS_RUNTIME
         // (`hardenedRuntime: true`), otherwise WKWebView WebContent/GPU XPC fails to attach
         // and leaves TaoView's uninitialized black OpenGL layer visible.
-        hardenedRuntime: hasDeveloperIdCert,
         entitlements: hasDeveloperIdCert ? "../../editions/entitlements.macos.plist" : null,
+        hardenedRuntime: hasDeveloperIdCert,
       },
       windows: {
         ...(baseConfig?.bundle?.windows ?? {}),

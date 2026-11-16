@@ -1,0 +1,15 @@
+[package]
+name = "bell-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "build-hub-dist"
+path = "src/bin/build_hub_dist.rs"
+
+[dependencies]
+bell-core = { path = "../bell-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

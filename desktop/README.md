@@ -1,10 +1,10 @@
-# BELL Desktop (macOS & Windows)
+# BELL Desktop (`v1.0.3` — macOS & Windows)
 
-Native macOS Universal (`aarch64` + `x86_64`) and Windows (`x86_64`) desktop shell and supervisor for **BELL Suite** and all 5 local-first workspaces, built with Rust (`bell-core`, `bell-daemon`, `bell-tauri`), Tauri v2 multi-webview layout, and zero-`node_modules` bundled Node 22 LTS sidecars.
+Native macOS Universal (`aarch64` + `x86_64`) and Windows (`x86_64`) desktop application and supervisor for **BELL Suite** and all 5 local-first workspaces, built with a **100% Pure-Rust** desktop workspace (`bell-core`, `bell-hub`, `bell-daemon`, `bell-tauri` — zero TypeScript in `desktop/`), standard Tauri v2 Single-Webview `WebviewWindow` architecture (zero `unstable` feature, zero top chrome bar, built-in `SuiteSwitcher` + `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5` navigation, Linear-grade dual-theme design system), and zero-`node_modules` bundled Node 22 LTS sidecars.
 
 ## Editions
 
-Every edition shares the same Rust core and UI shell, configured via `desktop/scripts/prepare-edition.mjs`:
+Every edition shares the same Pure-Rust core and `bell-hub` bundle, configured via `desktop/scripts/prepare-edition.mjs`:
 
 | Edition | Product Name | Bundle Identifier | Shortcut | Default Port | Accent (Light / Dark) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -19,15 +19,16 @@ Every edition shares the same Rust core and UI shell, configured via `desktop/sc
 
 ```text
 desktop/
-├── CONTRACT.md                  # Shared Rust <-> UI <-> Packaging interface contract
-├── Cargo.toml                   # Rust workspace (bell-core, bell-daemon, bell-tauri)
+├── CONTRACT.md                  # Shared Rust <-> Hub <-> Packaging interface contract
+├── Cargo.toml                   # Pure-Rust workspace (bell-core, bell-hub, bell-daemon, bell-tauri)
 ├── crates/
 │   ├── bell-core/               # Process supervisor, port allocation, Today feed, atomic SQLite vault backups
-│   ├── bell-daemon/             # Loopback HTTP control plane (127.0.0.1:4600) for browser/Linux preview
-│   └── bell-tauri/              # Native Tauri v2 app (44px chrome webview + native child workspace webviews)
-├── ui/                          # TypeScript + Vite desktop chrome & Suite Hub UI
+│   ├── bell-hub/                # Pure-Rust Linear-grade Suite Hub asset emitter (`build-hub-dist` -> hub-dist/)
+│   ├── bell-daemon/             # Loopback HTTP control plane (127.0.0.1:4600) serving hub-dist + REST API
+│   └── bell-tauri/              # Native Tauri v2 Single-Webview (`WebviewWindow`) app + menu/tray + Shortcuts
+├── hub-dist/                    # Generated static Hub assets (`index.html`, `hub.css`, `hub.js`)
 ├── icons/                       # Generated squircle PNG/ICO/ICNS icons for all 6 editions
-├── editions/                    # Tauri v2 configs (tauri.<edition>.conf.json) + entitlements.macos.plist
+├── editions/                    # Tauri v2 configs (tauri.<edition>.conf.json) + macOS entitlements plists
 ├── dist-sidecars/               # Gitignored self-contained CJS workspace bundles + embedded Node runtime
 └── scripts/
     ├── generate-icons.mjs       # Pure Node RGBA/ICO/ICNS icon generator (zero external dependencies)
@@ -43,24 +44,27 @@ desktop/
 node desktop/scripts/generate-icons.mjs
 ```
 
-Renders `32x32.png`, `128x128.png`, `128x128@2x.png`, `512x512.png`, `icon.ico`, and `icon.icns` in `desktop/icons/<edition>/` and syncs `suite` icons into `desktop/crates/bell-tauri/icons/`.
+### 2. Build & Test Pure-Rust Hub (`bell-hub -> hub-dist`)
 
-### 2. Bundle Zero-`node_modules` Sidecars & Smoke-Verify
+```bash
+cargo test --manifest-path desktop/Cargo.toml -p bell-core -p bell-hub -p bell-daemon
+cargo run --manifest-path desktop/Cargo.toml -p bell-hub --bin build-hub-dist
+```
+
+### 3. Bundle Zero-`node_modules` Sidecars & Smoke-Verify
 
 ```bash
 node desktop/scripts/bundle-sidecars.mjs --verify
 ```
 
-Bundles all 5 workspace backends (`personal`, `explain`, `pr`, `reader`, `campaign`) via `esbuild` into single-file `desktop/dist-sidecars/apps/<id>/server.cjs` bundles alongside static Vite `dist/` assets, then spawns all 5 sidecars from `/tmp` on isolated ports (`15601..15605`) to verify `/api/suite/manifest` / `/api/health` and static HTML serving with zero `node_modules`.
-
 Data-directory environment variables respected by each bundled sidecar:
 - `personal`: `BELLPERSONAL_DATA_DIR` (also accepts `BELL_DATA_DIR`)
 - `explain`: `BELL_DATA_DIR` / `BELL_EXPLAIN_DATA_DIR` / `BELL_DATA_PATH`
-- `pr`: `BELLPR_DATA_DIR` (also accepts `BELL_DATA_DIR`)
+- `pr`: `BELLPR_DATA_DIR` (also accepts `BELLPR_HOME` / `BELL_DATA_DIR`)
 - `reader`: `BELL_READER_DATA_DIR` (also accepts `BELL_DATA_DIR`)
 - `campaign`: `BELL_CAMPAIGN_DATA_DIR` (also accepts `BELL_DATA_DIR`)
 
-### 3. Prepare Edition Configs
+### 4. Prepare Edition Configs
 
 ```bash
 # Generate desktop/editions/tauri.<edition>.conf.json for all 6 editions
@@ -70,18 +74,9 @@ node desktop/scripts/prepare-edition.mjs all
 node desktop/scripts/prepare-edition.mjs explain --stage-resources --apply
 ```
 
-### 4. Build UI & Rust Workspace
+## Security & CI Verification Guarantees
 
-```bash
-npm --prefix desktop/ui install
-npm --prefix desktop/ui run build
-
-cargo test --manifest-path desktop/Cargo.toml
-```
-
-## Security & Local-First Guarantees
-
-- **Loopback-Only Listeners**: `bell-daemon` and all 5 sidecar workspaces bind exclusively to `127.0.0.1` by default.
-- **Strict Origin Validation**: Every mutating `POST` endpoint on `bell-daemon` validates `Origin` against the daemon's own loopback origin (`403` on mismatch), and workspace child webviews preserve each app's strict CSP (`frame-ancestors 'none'`) without iframes.
-- **Zero-Install Embedded Runtime**: Release installers generated by `.github/workflows/desktop-release.yml` embed SHA-256 verified Node.js `v22.22.1` LTS (`bell-runtime` Universal Mach-O on macOS via `lipo`, `bell-runtime.exe` on Windows x64, spawned with `CREATE_NO_WINDOW`).
-- **Atomic SQLite Vault Backups**: Vault backups snapshot each workspace SQLite database safely without corrupting active WAL writers.
+- **Zero-TypeScript Desktop Gate**: CI fails immediately if any `.ts` or `.tsx` file exists inside `desktop/`.
+- **Single-Webview Full-Frame Isolation**: Standard stable `WebviewWindow` navigates directly between the embedded Hub and `http://127.0.0.1:<port>` workspaces (built-in `SuiteSwitcher` + native `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5`), preserving every app's strict CSP (`frame-ancestors 'none'`) without iframes or multi-webview clipping.
+- **Physical macOS `WindowServer` Verification**: `.github/workflows/desktop-release.yml` verifies deep bundle code signatures (`codesign --verify --deep --strict`), runs live `WKWebView` + sidecar self-tests (`BELL_DESKTOP_SELFTEST_OUT`), and queries macOS `WindowServer` via CoreGraphics (`CGWindowListCopyWindowInfo(.optionOnScreenOnly)`) to prove a physical onscreen `NSWindow` (`>= 800x550`) renders before packaging `.dmg` / `.app.tar.gz`.
+- **Zero-Install Embedded Runtime & Atomic Vault**: Embeds SHA-256 verified Node.js `v22.22.1` LTS (`bell-runtime` Universal Mach-O on macOS, `bell-runtime.exe` on Windows x64 with `CREATE_NO_WINDOW`) and snapshots SQLite databases atomically.

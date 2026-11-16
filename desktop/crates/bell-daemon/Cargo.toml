@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.8"
 bell-core = { path = "../bell-core" }
+bell-hub = { path = "../bell-hub" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }

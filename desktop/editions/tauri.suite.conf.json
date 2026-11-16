@@ -2,11 +2,11 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "BELL Suite",
   "mainBinaryName": "bell-desktop",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "identifier": "com.bell1dev.suite",
   "build": {
-    "frontendDist": "../../ui/dist",
-    "devUrl": "http://127.0.0.1:5173"
+    "frontendDist": "../../hub-dist",
+    "devUrl": "http://127.0.0.1:4600"
   },
   "app": {
     "withGlobalTauri": true,
@@ -47,8 +47,8 @@
     },
     "macOS": {
       "minimumSystemVersion": "12.0",
-      "hardenedRuntime": false,
-      "entitlements": null
+      "entitlements": null,
+      "hardenedRuntime": false
     },
     "windows": {
       "webviewInstallMode": {

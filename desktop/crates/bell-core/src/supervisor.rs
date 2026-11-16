@@ -229,6 +229,14 @@ impl Supervisor {
         self.vault.read_pr_api_token()
     }
 
+    pub fn ensure_pr_api_token(&self) -> Result<String, SupervisorError> {
+        Ok(self.vault.ensure_pr_api_token()?)
+    }
+
+    pub fn preallocate_all_ports(&self) {
+        self.preallocate_ports(&AppId::ALL);
+    }
+
     fn ordered_apps(&self) -> Vec<AppId> {
         if let Some(primary) = self.config.edition.primary_app() {
             let mut list = vec![primary];

@@ -450,6 +450,12 @@ server.listen(port, host, () => {
         })
         .unwrap();
 
+        // Verify ensure_pr_api_token generates a valid 64-hex token before PR starts and is idempotent
+        let generated_tok = sup.ensure_pr_api_token().unwrap();
+        assert_eq!(generated_tok.len(), 64);
+        assert!(generated_tok.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(sup.ensure_pr_api_token().unwrap(), generated_tok);
+
         let initial = sup.status();
         let explain_init = initial
             .workspaces
@@ -644,6 +650,12 @@ srv.listen(port, "127.0.0.1");
             ready_timeout: Duration::from_secs(10),
         })
         .unwrap();
+
+        // Verify ensure_pr_api_token generates a valid 64-hex token before PR starts and is idempotent
+        let generated_tok = sup.ensure_pr_api_token().unwrap();
+        assert_eq!(generated_tok.len(), 64);
+        assert!(generated_tok.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(sup.ensure_pr_api_token().unwrap(), generated_tok);
 
         let status = sup.start_all().await.unwrap();
         // Verify token is readable via pr_api_token() and NEVER leaked into DesktopStatus JSON!

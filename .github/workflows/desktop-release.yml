@@ -34,7 +34,7 @@ env:
 
 jobs:
   prepare-bundles:
-    name: Bundle & Verify 5 Sidecars + UI Shell
+    name: Bundle & Verify 5 Sidecars + Pure-Rust Hub
     runs-on: ubuntu-latest
     outputs:
       editions: ${{ steps.matrix.outputs.editions }}
@@ -57,6 +57,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: bell-suite
+
+      - name: Enforce Zero-TypeScript Gate on desktop/
+        run: |
+          set -euo pipefail
+          ts_files="$(find bell-suite/desktop -type f \( -name '*.ts' -o -name '*.tsx' \) || true)"
+          if [ -n "${ts_files}" ]; then
+            echo "ERROR: TypeScript files are forbidden in desktop/: ${ts_files}" >&2
+            exit 1
+          fi
+          echo "Zero-TypeScript Gate passed (0 .ts/.tsx files in desktop/)."
 
       - name: Checkout BELL Personal
         uses: actions/checkout@v4
@@ -93,9 +103,26 @@ jobs:
         with:
           node-version: ${{ env.NODE_RUNTIME_VERSION }}
 
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust workspace target (hub)
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "bell-suite/desktop -> target"
+          key: linux-hub
+
       - name: Verify BELL Suite contract & CLI test suite
         working-directory: bell-suite
         run: npm test
+
+      - name: Test & build Pure-Rust BELL Hub (bell-hub -> hub-dist)
+        working-directory: bell-suite
+        run: |
+          cargo test --manifest-path desktop/Cargo.toml -p bell-core -p bell-hub -p bell-daemon
+          cargo run --manifest-path desktop/Cargo.toml -p bell-hub --bin build-hub-dist
+          test -f desktop/hub-dist/index.html
+          test -f desktop/hub-dist/hub.css
 
       - name: Install & build all 5 workspace frontends
         run: |
@@ -110,17 +137,6 @@ jobs:
             npm --prefix "${app_dir}" run build
             echo "::endgroup::"
           done
-
-      - name: Build & test BELL Desktop UI shell
-        working-directory: bell-suite/desktop/ui
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci --no-audit --no-fund
-          else
-            npm install --no-audit --no-fund
-          fi
-          npm test
-          npm run build
 
       - name: Generate edition icons & smoke-verify zero-node_modules sidecars
         working-directory: bell-suite
@@ -142,11 +158,11 @@ jobs:
           path: bell-suite/desktop/dist-sidecars/apps
           retention-days: 7
 
-      - name: Upload built Desktop UI dist
+      - name: Upload built Pure-Rust Hub dist
         uses: actions/upload-artifact@v4
         with:
-          name: desktop-ui-dist
-          path: bell-suite/desktop/ui/dist
+          name: desktop-hub-dist
+          path: bell-suite/desktop/hub-dist
           retention-days: 7
 
   create-release:
@@ -182,6 +198,7 @@ jobs:
                 body: [
                   "Native macOS Universal (`.dmg`, `.app.tar.gz`) and Windows x64 (`.msi`, `-setup.exe`) installers for **BELL Suite** and all 5 standalone workspaces (**Personal**, **Explain**, **PR**, **Web Reader**, **Campaign**).",
                   "",
+                  "- Pure-Rust `bell-hub` desktop shell (`WebviewWindow`, zero TypeScript, built-in `SuiteSwitcher` + `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5`).",
                   "- Embedded SHA-256 verified Node.js `v22.22.1` LTS runtime (`bell-runtime`) — zero external Node installation required.",
                   "- **macOS first-launch tip (unsigned preview)**: drag the app to `/Applications`, then run `xattr -cr \"/Applications/BELL Suite.app\"` (or right-click → Open) if Gatekeeper prompts.",
                 ].join("\n"),
@@ -248,11 +265,11 @@ jobs:
           name: desktop-sidecars-apps
           path: desktop/dist-sidecars/apps
 
-      - name: Download Desktop UI dist
+      - name: Download Pure-Rust Hub dist
         uses: actions/download-artifact@v4
         with:
-          name: desktop-ui-dist
-          path: desktop/ui/dist
+          name: desktop-hub-dist
+          path: desktop/hub-dist
 
       - name: Embed & codesign official Node v${{ env.NODE_RUNTIME_VERSION }} Universal runtime (macOS)
         if: runner.os == 'macOS'
@@ -383,7 +400,7 @@ jobs:
           includeUpdaterJson: false
           args: ${{ matrix.platform.tauri_args }}
 
-      - name: Verify real macOS .app WKWebView render & sidecar boot (${{ matrix.edition }})
+      - name: Verify real macOS .app WKWebView render, CoreGraphics NSWindow & sidecar boot (${{ matrix.edition }})
         if: runner.os == 'macOS'
         shell: bash
         env:
@@ -399,18 +416,30 @@ jobs:
           APP_BUNDLE="${apps[0]}"
           APP_BIN="${APP_BUNDLE}/Contents/MacOS/bell-desktop"
 
-          echo "=== Inspecting code signature for ${APP_BIN} ==="
+          echo "=== Inspecting code signature & deep bundle sealing for ${APP_BUNDLE} ==="
           codesign -dvvv "${APP_BIN}" 2>&1 | tee /tmp/bell-codesign.txt
           if [ "${HAS_APPLE_CERT}" != "true" ] && grep -Eq "flags=0x[0-9a-fA-F]*\\(.*runtime" /tmp/bell-codesign.txt; then
             echo "ERROR: Ad-hoc build must NOT carry CS_RUNTIME (Hardened Runtime) flag!" >&2
             exit 1
           fi
+          codesign --verify --deep --strict --verbose=2 "${APP_BUNDLE}"
 
           SELFTEST_JSON="$(mktemp /tmp/bell-selftest-XXXXXX.json)"
           VAULT_TMP="$(mktemp -d)"
-          trap 'rm -rf "${VAULT_TMP}"' EXIT
+          CG_SWIFT="$(mktemp /tmp/bell-cgwindow-XXXXXX.swift)"
+          CG_PROBE="$(mktemp /tmp/bell-cgwindow-bin-XXXXXX)"
+          APP_PID=""
+          cleanup_verify() {
+            if [ -n "${APP_PID}" ] && kill -0 "${APP_PID}" 2>/dev/null; then
+              pkill -TERM -P "${APP_PID}" 2>/dev/null || true
+              kill -TERM "${APP_PID}" 2>/dev/null || true
+              wait "${APP_PID}" 2>/dev/null || true
+            fi
+            rm -rf "${VAULT_TMP}" "${SELFTEST_JSON}" "${CG_SWIFT}" "${CG_PROBE}"
+          }
+          trap cleanup_verify EXIT
 
-          echo "=== Launching ${APP_BUNDLE} for live WKWebView + sidecar verification ==="
+          echo "=== 1/2 Launching ${APP_BUNDLE} for live WKWebView DOM + sidecar self-test ==="
           BELL_DESKTOP_EDITION="${{ matrix.edition }}" \
           BELL_DESKTOP_VAULT_DIR="${VAULT_TMP}" \
           BELL_DESKTOP_SELFTEST_OUT="${SELFTEST_JSON}" \
@@ -423,20 +452,82 @@ jobs:
           if (!report.ok) {
             throw new Error(`macOS runtime self-test failed: ${JSON.stringify(report)}`);
           }
-          if (!report.domReady || report.domReady.chromeHeight < 36 || report.domReady.textLength < 10) {
+          const renderedHeight = Math.max(
+            Number(report.domReady?.mainHeight ?? 0),
+            Number(report.domReady?.chromeHeight ?? 0),
+            Number(report.domReady?.viewportHeight ?? 0),
+            Number(report.domReady?.height ?? 0),
+          );
+          if (!report.domReady || renderedHeight < 36 || Number(report.domReady.textLength ?? 0) < 10) {
             throw new Error(`WKWebView failed to render visible DOM: ${JSON.stringify(report.domReady)}`);
           }
           if (report.installedWorkspaces < 1 || report.healthyRunningWorkspaces !== report.installedWorkspaces) {
             throw new Error(`Bundled sidecars unhealthy: ${report.healthyRunningWorkspaces}/${report.installedWorkspaces}`);
           }
           console.log(
-            `VERIFIED macOS WKWebView render (${report.edition}): chromeHeight=${report.domReady.chromeHeight}px, mainHeight=${report.domReady.mainHeight}px, textLength=${report.domReady.textLength}, sidecars=${report.healthyRunningWorkspaces}/${report.installedWorkspaces}`,
+            `VERIFIED macOS WKWebView DOM (${report.edition}): height=${renderedHeight}px, textLength=${report.domReady.textLength}, sidecars=${report.healthyRunningWorkspaces}/${report.installedWorkspaces}`,
           );
           EOF
+
+          echo "=== 2/2 Probing macOS WindowServer CoreGraphics onscreen NSWindow ==="
+          cat > "${CG_SWIFT}" <<'SWIFT'
+          import CoreGraphics
+          import Foundation
+
+          guard CommandLine.arguments.count > 1, let targetPid = Int(CommandLine.arguments[1]) else {
+            exit(2)
+          }
+          let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+          for w in list {
+            let pid = w[kCGWindowOwnerPID as String] as? Int ?? 0
+            let owner = w[kCGWindowOwnerName as String] as? String ?? ""
+            let onScreen = (w[kCGWindowIsOnscreen as String] as? Bool) ?? ((w[kCGWindowIsOnscreen as String] as? Int ?? 0) != 0)
+            let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
+            let width = b["Width"] as? Double ?? 0
+            let height = b["Height"] as? Double ?? 0
+            if pid == targetPid && onScreen && width >= 800 && height >= 550 {
+              print("ONSCREEN_WINDOW_OK pid=\(pid) owner=\(owner) \(Int(width))x\(Int(height))")
+              exit(0)
+            }
+          }
+          exit(1)
+          SWIFT
+          swiftc -O "${CG_SWIFT}" -o "${CG_PROBE}"
+
+          BELL_DESKTOP_EDITION="${{ matrix.edition }}" \
+          BELL_DESKTOP_VAULT_DIR="${VAULT_TMP}" \
+            "${APP_BIN}" </dev/null >/tmp/bell-live-app.log 2>&1 &
+          APP_PID=$!
+
+          WINDOW_OK=0
+          for _ in $(seq 1 48); do
+            if ! kill -0 "${APP_PID}" 2>/dev/null; then
+              echo "ERROR: ${APP_BIN} exited before registering an onscreen NSWindow!" >&2
+              cat /tmp/bell-live-app.log >&2 || true
+              exit 1
+            fi
+            if "${CG_PROBE}" "${APP_PID}"; then
+              WINDOW_OK=1
+              break
+            fi
+            sleep 0.25
+          done
+
+          pkill -TERM -P "${APP_PID}" 2>/dev/null || true
+          kill -TERM "${APP_PID}" 2>/dev/null || true
+          wait "${APP_PID}" 2>/dev/null || true
+          APP_PID=""
+
+          if [ "${WINDOW_OK}" -ne 1 ]; then
+            echo "ERROR: macOS WindowServer never reported an onscreen NSWindow (>=800x550)!" >&2
+            cat /tmp/bell-live-app.log >&2 || true
+            exit 1
+          fi
 
           BUNDLE_DIR="$(dirname "${APP_BUNDLE}")"
           APP_BASE="$(basename "${APP_BUNDLE}" .app)"
           DOT_SLUG="$(printf '%s' "${APP_BASE}" | tr ' ' '.')"
+          codesign --verify --deep --strict --verbose=2 "${APP_BUNDLE}"
           rm -f "${BUNDLE_DIR}"/*.app.tar.gz "${BUNDLE_DIR}"/*.app.tar.gz.sig
           COPYFILE_DISABLE=1 tar -czf "${BUNDLE_DIR}/${DOT_SLUG}_universal.app.tar.gz" \
             -C "${BUNDLE_DIR}" "$(basename "${APP_BUNDLE}")"

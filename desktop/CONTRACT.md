@@ -1,6 +1,6 @@
-# BELL Desktop Shared Interface Contract
+# BELL Desktop Shared Interface Contract (`v1.0.3`)
 
-Single source of truth for the Rust workspace (`crates/bell-core`, `crates/bell-daemon`, `crates/bell-tauri`), Desktop Shell UI (`ui/`), and Packaging/CI (`scripts/`, `.github/workflows/desktop-release.yml`).
+Single source of truth for the 100% Pure-Rust workspace (`crates/bell-core`, `crates/bell-hub`, `crates/bell-daemon`, `crates/bell-tauri` — zero TypeScript in `desktop/`, generating `hub-dist/` via Cargo), Single-Webview `WebviewWindow` shell (zero top chrome bar; built-in `SuiteSwitcher` + `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5` navigation + Linear-grade design system), and Packaging/CI (`scripts/`, `.github/workflows/desktop-release.yml`).
 
 ## 1. Products & Ground-Truth Brand Tokens
 
@@ -58,7 +58,7 @@ Runtime resolution order in `bell-core`:
 ```json
 {
   "edition": "suite",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "os": "macos",
   "arch": "aarch64",
   "activeTarget": "hub",
@@ -147,7 +147,7 @@ Note: `WorkspaceState` is `"stopped" | "starting" | "running" | "error"`. `activ
 | :--- | :--- | :--- | :--- |
 | Get full status | `GET /api/desktop/status` | `desktop_status()` | `-> DesktopStatus` |
 | Get Today feed | `GET /api/desktop/today` | `desktop_today()` | `-> TodayOverview` |
-| Switch active view / child webview | `POST /api/desktop/activate` `{ target, route? }` | `desktop_activate({ target, route })` | `-> DesktopStatus` |
+| Switch active view / workspace | `POST /api/desktop/activate` `{ target, route? }` | `desktop_activate({ target, route })` | `-> DesktopStatus` |
 | Start / Stop / Restart workspace | `POST /api/desktop/workspaces/:id/:action` (`start`\|`stop`\|`restart`) | `desktop_workspace_action({ id, action })` | `-> DesktopStatus` |
 | Start all workspaces | `POST /api/desktop/workspaces/start-all` | `desktop_start_all()` | `-> DesktopStatus` |
 | Update preferences | `POST /api/desktop/prefs` `{ theme?, lang?, autoStart? }` | `desktop_save_prefs({ theme, lang, autoStart })` | `-> DesktopStatus` |

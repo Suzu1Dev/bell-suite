@@ -4,8 +4,8 @@ use bell_core::{
     AppId, DesktopStatus, Edition, PrefsPatch, Supervisor, SupervisorConfig, TodayOverview,
     VaultBackupResult, WorkspaceLogs, WorkspaceState,
 };
+use bell_hub::{HubRenderModel, HubUiClientState, HubViewPatch};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -14,24 +14,26 @@ use std::sync::{
 use tauri::{
     menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder, Submenu, SubmenuBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    window::Color,
-    AppHandle, LogicalPosition, LogicalSize, Manager, Rect, RunEvent, State, WebviewUrl,
-    WindowEvent, Wry,
+    webview::NewWindowResponse,
+    AppHandle, Manager, RunEvent, State, Theme, WebviewUrl, Wry,
 };
 use url::Url;
 
-const CHROME_BAR_HEIGHT: f64 = 44.0;
 const DEFAULT_WIDTH: f64 = 1360.0;
 const DEFAULT_HEIGHT: f64 = 860.0;
 const MIN_WIDTH: f64 = 900.0;
 const MIN_HEIGHT: f64 = 620.0;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopRenderReport {
+    #[serde(default)]
     chrome_height: u32,
+    #[serde(default)]
     main_height: u32,
+    #[serde(default)]
     text_length: usize,
+    #[serde(default)]
     theme: String,
 }
 
@@ -44,203 +46,151 @@ struct SelftestCoordinator {
 
 struct AppState {
     supervisor: Arc<Supervisor>,
-    webview_ports: Mutex<BTreeMap<AppId, u16>>,
+    hub_url: Mutex<Url>,
+    initial_pr_port: u16,
     selftest: Option<Arc<SelftestCoordinator>>,
 }
 
-fn surface_color_for_theme(theme_pref: &str) -> Color {
-    if theme_pref.eq_ignore_ascii_case("dark") {
-        Color(19, 20, 23, 255)
+fn default_hub_url() -> Url {
+    if cfg!(target_os = "windows") {
+        Url::parse("http://tauri.localhost/index.html").expect("valid windows hub url")
     } else {
-        Color(247, 245, 240, 255)
+        Url::parse("tauri://localhost/index.html").expect("valid unix hub url")
     }
 }
 
-fn set_webview_rect(wv: &tauri::Webview, x: f64, y: f64, width: f64, height: f64) {
-    let _ = wv.set_bounds(Rect {
-        position: LogicalPosition::new(x, y).into(),
-        size: LogicalSize::new(width.max(1.0), height.max(1.0)).into(),
-    });
+fn parse_tauri_theme(theme_pref: &str) -> Option<Theme> {
+    if theme_pref.eq_ignore_ascii_case("dark") {
+        Some(Theme::Dark)
+    } else if theme_pref.eq_ignore_ascii_case("light") {
+        Some(Theme::Light)
+    } else {
+        None
+    }
 }
 
-fn window_logical_size(window: &tauri::Window) -> (f64, f64) {
-    let scale = window.scale_factor().unwrap_or(1.0);
-    if let Ok(phys) = window.inner_size() {
-        let logical = phys.to_logical::<f64>(scale);
-        (logical.width.max(320.0), logical.height.max(200.0))
+fn build_pr_origin_guarded_init_script(token: &str, pr_port: u16) -> String {
+    let origin_127 = format!("http://127.0.0.1:{pr_port}");
+    let origin_local = format!("http://localhost:{pr_port}");
+    format!(
+        "(function(){{if(window.location&&(window.location.origin==={origin_127:?}||window.location.origin==={origin_local:?})){{try{{sessionStorage.setItem('bellpr-api-token',{token:?});}}catch(_){{}}}}}})();"
+    )
+}
+
+fn sanitize_hash_route(route: Option<&str>) -> String {
+    let Some(raw) = route else {
+        return String::new();
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return String::new();
+    }
+    if trimmed.starts_with('#') {
+        trimmed.to_string()
+    } else if trimmed.starts_with('/') {
+        format!("#{trimmed}")
     } else {
-        (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        format!("#/{trimmed}")
     }
 }
 
 fn show_and_focus_main(app: &AppHandle) {
-    if let Some(window) = app.get_window("main") {
+    if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
 }
 
-fn pr_token_init_script(token: &str) -> String {
-    format!("try {{ sessionStorage.setItem('bellpr-api-token', {token:?}); }} catch {{}}")
+fn open_external_browser(url_str: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("/usr/bin/open")
+            .arg(url_str)
+            .spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", url_str])
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(url_str)
+            .spawn();
+    }
 }
 
-fn resize_webview_bounds(app: &AppHandle) {
-    let Some(window) = app.get_window("main") else {
+fn notify_hub_sync(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let is_remote_workspace = window
+            .url()
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h == "127.0.0.1" || h == "localhost"))
+            .unwrap_or(false);
+        if !is_remote_workspace {
+            let _ = window.eval("window.dispatchEvent(new CustomEvent('bell:sync'))");
+        }
+    }
+}
+
+fn navigate_to_hub(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    let Some(chrome) = app.get_webview("chrome") else {
+    let (hub_url, title) = if let Some(state) = app.try_state::<AppState>() {
+        let url = state
+            .hub_url
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        (url, state.supervisor.edition().display_name().to_string())
+    } else {
+        (default_hub_url(), Edition::active().display_name().to_string())
+    };
+    let _ = window.set_title(&title);
+    let _ = window.navigate(hub_url);
+}
+
+fn navigate_to_workspace(app: &AppHandle, app_id: AppId, route: Option<&str>) {
+    let Some(window) = app.get_webview_window("main") else {
         return;
     };
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
 
-    let (width, height) = window_logical_size(&window);
     let status = state.supervisor.status();
+    let Some(ws) = status
+        .workspaces
+        .iter()
+        .find(|w| w.id == app_id && w.state == WorkspaceState::Running)
+    else {
+        return;
+    };
 
-    let active_running = status
-        .active_target
-        .parse::<AppId>()
-        .ok()
-        .and_then(|target_id| {
-            status
-                .workspaces
-                .iter()
-                .find(|w| w.id == target_id && w.state == WorkspaceState::Running)
-                .map(|_| target_id)
-        });
-
-    if let Some(target_id) = active_running {
-        set_webview_rect(&chrome, 0.0, 0.0, width, CHROME_BAR_HEIGHT);
-        if let Some(wv) = app.get_webview(&format!("ws-{}", target_id.as_str())) {
-            let ws_height = (height - CHROME_BAR_HEIGHT).max(100.0);
-            set_webview_rect(&wv, 0.0, CHROME_BAR_HEIGHT, width, ws_height);
+    let hash_suffix = sanitize_hash_route(route);
+    let full_url_str = if app_id == AppId::Pr
+        && ws.port != state.initial_pr_port
+        && hash_suffix.is_empty()
+    {
+        if let Some(tok) = state.supervisor.pr_api_token() {
+            format!("http://127.0.0.1:{}/#bell_token={tok}", ws.port)
+        } else {
+            format!("http://127.0.0.1:{}/", ws.port)
         }
     } else {
-        set_webview_rect(&chrome, 0.0, 0.0, width, height);
+        format!("http://127.0.0.1:{}/{hash_suffix}", ws.port)
+    };
+
+    if let Ok(parsed) = Url::parse(&full_url_str) {
+        let _ = window.set_title(app_id.display_name());
+        let _ = window.navigate(parsed);
     }
-}
-
-fn sync_webview_layout(app: &AppHandle, route: Option<&str>) {
-    let Some(window) = app.get_window("main") else {
-        return;
-    };
-    let Some(chrome) = app.get_webview("chrome") else {
-        return;
-    };
-    let Some(state) = app.try_state::<AppState>() else {
-        return;
-    };
-
-    let (width, height) = window_logical_size(&window);
-    let status = state.supervisor.status();
-    let bg = surface_color_for_theme(&status.prefs.theme);
-
-    let active_running = status
-        .active_target
-        .parse::<AppId>()
-        .ok()
-        .and_then(|target_id| {
-            status
-                .workspaces
-                .iter()
-                .find(|w| w.id == target_id && w.state == WorkspaceState::Running)
-                .map(|w| (target_id, w.port))
-        });
-
-    if let Some((target_id, port)) = active_running {
-        for id in AppId::ALL {
-            if id != target_id {
-                if let Some(wv) = app.get_webview(&format!("ws-{}", id.as_str())) {
-                    let _ = wv.hide();
-                }
-            }
-        }
-
-        set_webview_rect(&chrome, 0.0, 0.0, width, CHROME_BAR_HEIGHT);
-
-        let ws_height = (height - CHROME_BAR_HEIGHT).max(100.0);
-        let hash_suffix = match route {
-            Some(r) if !r.trim().is_empty() => {
-                let trimmed = r.trim();
-                if trimmed.starts_with('#') {
-                    trimmed.to_string()
-                } else {
-                    format!("#{trimmed}")
-                }
-            }
-            _ => String::new(),
-        };
-        let full_url_str = format!("http://127.0.0.1:{port}/{hash_suffix}");
-        let label = format!("ws-{}", target_id.as_str());
-
-        if let Some(wv) = app.get_webview(&label) {
-            let prev_port = state
-                .webview_ports
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&target_id)
-                .copied();
-
-            if prev_port != Some(port) {
-                if let Ok(parsed) = Url::parse(&full_url_str) {
-                    let _ = wv.navigate(parsed);
-                    state
-                        .webview_ports
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(target_id, port);
-                }
-                if target_id == AppId::Pr {
-                    if let Some(tok) = state.supervisor.pr_api_token() {
-                        let _ = wv.eval(pr_token_init_script(&tok));
-                    }
-                }
-            } else if !hash_suffix.is_empty() {
-                if let Ok(json_hash) = serde_json::to_string(&hash_suffix) {
-                    let _ = wv.eval(format!(
-                        "if (window.location.hash !== {json_hash}) {{ window.location.hash = {json_hash}; }}"
-                    ));
-                }
-            }
-
-            set_webview_rect(&wv, 0.0, CHROME_BAR_HEIGHT, width, ws_height);
-            let _ = wv.show();
-        } else if let Ok(parsed) = Url::parse(&full_url_str) {
-            let mut builder =
-                tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed))
-                    .background_color(bg);
-            if target_id == AppId::Pr {
-                if let Some(tok) = state.supervisor.pr_api_token() {
-                    builder = builder.initialization_script(pr_token_init_script(&tok));
-                }
-            }
-            if window
-                .add_child(
-                    builder,
-                    LogicalPosition::new(0.0, CHROME_BAR_HEIGHT),
-                    LogicalSize::new(width, ws_height),
-                )
-                .is_ok()
-            {
-                state
-                    .webview_ports
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(target_id, port);
-            }
-        }
-    } else {
-        for id in AppId::ALL {
-            if let Some(wv) = app.get_webview(&format!("ws-{}", id.as_str())) {
-                let _ = wv.hide();
-            }
-        }
-        set_webview_rect(&chrome, 0.0, 0.0, width, height);
-    }
-
-    let _ = chrome.eval("window.dispatchEvent(new CustomEvent('bell:sync'))");
 }
 
 fn try_complete_selftest(app: &AppHandle, force_timeout: bool) {
@@ -273,9 +223,9 @@ fn try_complete_selftest(app: &AppHandle, force_timeout: bool) {
         .filter(|w| w.installed && w.state == WorkspaceState::Running && w.manifest_valid)
         .count();
 
-    let dom_ok = dom_opt
-        .as_ref()
-        .is_some_and(|d| d.chrome_height >= 36 && d.text_length >= 10);
+    let dom_ok = dom_opt.as_ref().is_some_and(|d| {
+        d.text_length >= 10 && d.main_height >= 36 && d.chrome_height >= 36
+    });
     let sidecars_ok = installed_count > 0 && healthy_running_count == installed_count;
     let all_ok = dom_ok && sidecars_ok && !force_timeout;
 
@@ -313,6 +263,36 @@ fn try_complete_selftest(app: &AppHandle, force_timeout: bool) {
 }
 
 #[tauri::command]
+async fn desktop_hub_render(
+    state: State<'_, AppState>,
+    ui: Option<HubUiClientState>,
+) -> Result<HubViewPatch, String> {
+    let ui = ui.unwrap_or_default();
+    let status = state.supervisor.status();
+    let need_today = matches!(ui.view.as_str(), "" | "overview" | "today") || ui.palette_open;
+    let today_val = if need_today {
+        Some(state.supervisor.today().await)
+    } else {
+        None
+    };
+    let logs_val = if ui.view == "logs" {
+        let logs_app = ui
+            .logs_app
+            .unwrap_or_else(|| status.edition.primary_app().unwrap_or(AppId::Personal));
+        Some(state.supervisor.logs(logs_app))
+    } else {
+        None
+    };
+
+    Ok(bell_hub::render_hub_patch(&HubRenderModel {
+        status: &status,
+        today: today_val.as_ref(),
+        logs: logs_val.as_ref(),
+        ui: &ui,
+    }))
+}
+
+#[tauri::command]
 async fn desktop_status(state: State<'_, AppState>) -> Result<DesktopStatus, String> {
     Ok(state.supervisor.status())
 }
@@ -329,11 +309,39 @@ async fn desktop_activate(
     target: String,
     route: Option<String>,
 ) -> Result<DesktopStatus, String> {
+    let norm = target.trim().to_ascii_lowercase();
+    if norm == "hub" {
+        let status = state
+            .supervisor
+            .activate("hub")
+            .map_err(|e| e.to_string())?;
+        navigate_to_hub(&app);
+        return Ok(status);
+    }
+
+    let app_id: AppId = norm.parse()?;
+    let needs_start = state
+        .supervisor
+        .status()
+        .workspaces
+        .iter()
+        .find(|w| w.id == app_id)
+        .is_some_and(|w| {
+            w.installed && matches!(w.state, WorkspaceState::Stopped | WorkspaceState::Error)
+        });
+    if needs_start {
+        state
+            .supervisor
+            .start_workspace(app_id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
     let status = state
         .supervisor
-        .activate(&target)
+        .activate(app_id.as_str())
         .map_err(|e| e.to_string())?;
-    sync_webview_layout(&app, route.as_deref());
+    navigate_to_workspace(&app, app_id, route.as_deref());
     Ok(status)
 }
 
@@ -350,7 +358,7 @@ async fn desktop_workspace_action(
         .workspace_action(app_id, &action)
         .await
         .map_err(|e| e.to_string())?;
-    sync_webview_layout(&app, None);
+    notify_hub_sync(&app);
     Ok(status)
 }
 
@@ -364,7 +372,7 @@ async fn desktop_start_all(
         .start_all()
         .await
         .map_err(|e| e.to_string())?;
-    sync_webview_layout(&app, None);
+    notify_hub_sync(&app);
     Ok(status)
 }
 
@@ -386,13 +394,10 @@ async fn desktop_save_prefs(
         })
         .map_err(|e| e.to_string())?;
 
-    let bg = surface_color_for_theme(&updated.prefs.theme);
-    if let Some(window) = app.get_window("main") {
-        let _ = window.set_background_color(Some(bg));
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_theme(parse_tauri_theme(&updated.prefs.theme));
     }
-    if let Some(chrome) = app.get_webview("chrome") {
-        let _ = chrome.set_background_color(Some(bg));
-    }
+    notify_hub_sync(&app);
     Ok(updated)
 }
 
@@ -410,7 +415,7 @@ async fn desktop_logs(state: State<'_, AppState>, id: String) -> Result<Workspac
 #[tauri::command]
 async fn desktop_window_action(app: AppHandle, action: String) -> Result<(), String> {
     let window = app
-        .get_window("main")
+        .get_webview_window("main")
         .ok_or_else(|| "main window not found".to_string())?;
     match action.as_str() {
         "minimize" => window.minimize().map_err(|e| e.to_string()),
@@ -444,7 +449,7 @@ async fn desktop_report_ready(
 
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let show_item = MenuItem::with_id(app, "show", "Show BELL", true, None::<&str>)?;
-    let hub_item = MenuItem::with_id(app, "hub", "Suite Hub", true, None::<&str>)?;
+    let hub_item = MenuItem::with_id(app, "hub", "BELL Hub", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit BELL", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_item, &hub_item, &quit_item])?;
 
@@ -457,7 +462,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(st) = app.try_state::<AppState>() {
                     let _ = st.supervisor.activate("hub");
                 }
-                sync_webview_layout(app, None);
+                navigate_to_hub(app);
                 show_and_focus_main(app);
             }
             "quit" => app.exit(0),
@@ -482,7 +487,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn build_workspaces_submenu(app: &tauri::App) -> Result<Submenu<Wry>, tauri::Error> {
-    let hub = MenuItemBuilder::with_id("nav:hub", "Suite Hub")
+    let hub = MenuItemBuilder::with_id("nav:hub", "BELL Hub")
         .accelerator("CmdOrCtrl+0")
         .build(app)?;
     let personal = MenuItemBuilder::with_id("nav:personal", "BELL Personal")
@@ -586,37 +591,64 @@ fn main() {
                 let app_bg = app_handle.clone();
                 let target_owned = target.to_string();
                 tauri::async_runtime::spawn(async move {
-                    if let Some(st) = app_bg.try_state::<AppState>() {
-                        if let Ok(next) = st.supervisor.activate(&target_owned) {
-                            if let Ok(app_id) = target_owned.parse::<AppId>() {
-                                let needs_start = next
-                                    .workspaces
-                                    .iter()
-                                    .find(|w| w.id == app_id)
-                                    .is_some_and(|w| {
-                                        w.installed
-                                            && matches!(
-                                                w.state,
-                                                WorkspaceState::Stopped | WorkspaceState::Error
-                                            )
-                                    });
-                                if needs_start {
-                                    let _ = st.supervisor.start_workspace(app_id).await;
-                                }
-                            }
-                        }
-                        sync_webview_layout(&app_bg, None);
+                    let Some(st) = app_bg.try_state::<AppState>() else {
+                        return;
+                    };
+                    if target_owned == "hub" {
+                        let _ = st.supervisor.activate("hub");
+                        navigate_to_hub(&app_bg);
+                        show_and_focus_main(&app_bg);
+                        return;
                     }
+                    let Ok(app_id) = target_owned.parse::<AppId>() else {
+                        return;
+                    };
+                    let needs_start = st
+                        .supervisor
+                        .status()
+                        .workspaces
+                        .iter()
+                        .find(|w| w.id == app_id)
+                        .is_some_and(|w| {
+                            w.installed
+                                && matches!(w.state, WorkspaceState::Stopped | WorkspaceState::Error)
+                        });
+                    if needs_start {
+                        let _ = st.supervisor.start_workspace(app_id).await;
+                    }
+                    let _ = st.supervisor.activate(app_id.as_str());
+                    navigate_to_workspace(&app_bg, app_id, None);
+                    show_and_focus_main(&app_bg);
                 });
             }
         })
         .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Regular);
+
             let resource_dir = app.path().resource_dir().ok();
             let supervisor = Supervisor::new(SupervisorConfig {
                 edition,
                 resource_dir,
                 ..Default::default()
             })?;
+
+            // Always greet BELL Suite with BELL Hub on fresh app launch
+            if edition == Edition::Suite {
+                let _ = supervisor.activate("hub");
+            }
+
+            // Pre-allocate ports & PR bearer token BEFORE building WebviewWindow so
+            // origin-guarded initialization_script always knows PR's port and secret.
+            supervisor.preallocate_all_ports();
+            let pr_token = supervisor.ensure_pr_api_token().unwrap_or_default();
+            let initial_status = supervisor.status();
+            let initial_pr_port = initial_status
+                .workspaces
+                .iter()
+                .find(|w| w.id == AppId::Pr)
+                .map(|w| w.port)
+                .unwrap_or_else(|| AppId::Pr.default_port());
 
             let selftest = selftest_out.map(|out_path| {
                 Arc::new(SelftestCoordinator {
@@ -627,70 +659,85 @@ fn main() {
                 })
             });
 
-            app.manage(AppState {
-                supervisor: supervisor.clone(),
-                webview_ports: Mutex::new(BTreeMap::new()),
-                selftest: selftest.clone(),
-            });
-
             setup_app_menu(app, edition.display_name())?;
             setup_tray(app)?;
 
-            let initial_status = supervisor.status();
-            let initial_bg = surface_color_for_theme(&initial_status.prefs.theme);
+            let pr_init_js = build_pr_origin_guarded_init_script(&pr_token, initial_pr_port);
+            let nav_handle = app.handle().clone();
+            let sup_for_new_win = supervisor.clone();
 
-            let mut win_builder = tauri::window::WindowBuilder::new(app, "main")
-                .title(edition.display_name())
-                .inner_size(DEFAULT_WIDTH, DEFAULT_HEIGHT)
-                .min_inner_size(MIN_WIDTH, MIN_HEIGHT)
-                .prevent_overflow()
-                .center()
-                .visible(false)
-                .background_color(initial_bg);
+            let mut win_builder = tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                WebviewUrl::App("index.html".into()),
+            )
+            .title(edition.display_name())
+            .inner_size(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            .min_inner_size(MIN_WIDTH, MIN_HEIGHT)
+            .center()
+            .visible(true)
+            .focused(true)
+            .theme(parse_tauri_theme(&initial_status.prefs.theme))
+            .on_new_window(move |url, _features| {
+                let is_workspace_url = (url.scheme() == "http" || url.scheme() == "https")
+                    && matches!(url.host_str(), Some("127.0.0.1" | "localhost"))
+                    && url.port().is_some_and(|p| {
+                        sup_for_new_win
+                            .status()
+                            .workspaces
+                            .iter()
+                            .any(|w| w.port == p)
+                    });
+                if is_workspace_url {
+                    let h = nav_handle.clone();
+                    let target_url = url.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(win) = h.get_webview_window("main") {
+                            let _ = win.navigate(target_url);
+                        }
+                    });
+                } else if matches!(url.scheme(), "http" | "https") {
+                    open_external_browser(url.as_str());
+                }
+                NewWindowResponse::Deny
+            });
 
-            #[cfg(target_os = "macos")]
-            {
-                win_builder = win_builder
-                    .title_bar_style(tauri::TitleBarStyle::Overlay)
-                    .hidden_title(true);
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                win_builder = win_builder.decorations(false);
+            if !pr_token.is_empty() {
+                win_builder = win_builder.initialization_script(&pr_init_js);
             }
 
             let window = win_builder.build()?;
+
+            #[cfg(target_os = "macos")]
+            {
+                let win_for_close = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = win_for_close.hide();
+                    }
+                });
+            }
 
             #[cfg(target_os = "windows")]
             {
                 let _ = window.hide_menu();
             }
 
-            let (init_w, init_h) = window_logical_size(&window);
-            let chrome_builder =
-                tauri::webview::WebviewBuilder::new("chrome", WebviewUrl::App("index.html".into()))
-                    .background_color(initial_bg);
+            let captured_hub_url = window.url().unwrap_or_else(|_| default_hub_url());
+            app.manage(AppState {
+                supervisor: supervisor.clone(),
+                hub_url: Mutex::new(captured_hub_url),
+                initial_pr_port,
+                selftest: selftest.clone(),
+            });
 
-            window.add_child(
-                chrome_builder,
-                LogicalPosition::new(0.0, 0.0),
-                LogicalSize::new(init_w, init_h),
-            )?;
-
+            #[cfg(target_os = "macos")]
+            {
+                let _ = app.handle().show();
+            }
             let _ = window.show();
             let _ = window.set_focus();
-            resize_webview_bounds(app.handle());
-
-            let handle_for_resize = app.handle().clone();
-            window.on_window_event(move |event| {
-                if matches!(
-                    event,
-                    WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }
-                ) {
-                    resize_webview_bounds(&handle_for_resize);
-                }
-            });
 
             let should_start = initial_status.prefs.auto_start || selftest.is_some();
             if should_start {
@@ -699,7 +746,13 @@ fn main() {
                 let selftest_bg = selftest.clone();
                 tauri::async_runtime::spawn(async move {
                     let _ = sup_bg.start_all().await;
-                    sync_webview_layout(&handle_bg, None);
+                    if let Some(primary) = edition.primary_app() {
+                        if selftest_bg.is_none() {
+                            navigate_to_workspace(&handle_bg, primary, None);
+                        }
+                    } else {
+                        notify_hub_sync(&handle_bg);
+                    }
                     if let Some(st) = selftest_bg {
                         st.autostart_done.store(true, Ordering::SeqCst);
                         try_complete_selftest(&handle_bg, false);
@@ -720,6 +773,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            desktop_hub_render,
             desktop_status,
             desktop_today,
             desktop_activate,
@@ -734,8 +788,20 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("failed to build BELL Desktop application");
 
-    app.run(|app_handle, event| {
-        if let RunEvent::Exit = event {
+    app.run(|app_handle, event| match event {
+        RunEvent::Ready => {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = app_handle.show();
+            }
+            show_and_focus_main(app_handle);
+        }
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => {
+            let _ = app_handle.show();
+            show_and_focus_main(app_handle);
+        }
+        RunEvent::Exit => {
             if let Some(state) = app_handle.try_state::<AppState>() {
                 let sup = state.supervisor.clone();
                 tauri::async_runtime::block_on(async move {
@@ -743,5 +809,6 @@ fn main() {
                 });
             }
         }
+        _ => {}
     });
 }

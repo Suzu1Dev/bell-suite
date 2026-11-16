@@ -1,15 +1,16 @@
 use axum::{
     body::Bytes,
-    extract::{Path as AxumPath, Request, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    extract::{Path as AxumPath, Query, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use bell_core::{
     AppId, Edition, PrefsPatch, Supervisor, SupervisorConfig, SupervisorError, WorkspaceState,
 };
+use bell_hub::{HubRenderModel, HubUiClientState};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -37,6 +38,27 @@ struct PrefsBody {
     theme: Option<String>,
     lang: Option<String>,
     auto_start: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct HubRenderQuery {
+    demo: Option<String>,
+    edition: Option<String>,
+    theme: Option<String>,
+    lang: Option<String>,
+}
+
+fn parse_hub_ui_body(body: &[u8]) -> Result<HubUiClientState, serde_json::Error> {
+    if body.is_empty() {
+        return Ok(HubUiClientState::default());
+    }
+    let val: Value = serde_json::from_slice(body)?;
+    if let Some(nested) = val.get("ui") {
+        if nested.is_object() {
+            return serde_json::from_value(nested.clone());
+        }
+    }
+    serde_json::from_value(val)
 }
 
 #[derive(Debug, Clone)]
@@ -330,10 +352,134 @@ async fn handle_logs(
     Json(state.supervisor.logs(app_id)).into_response()
 }
 
+async fn handle_hub_render(
+    State(state): State<DaemonState>,
+    Query(query): Query<HubRenderQuery>,
+    body: Bytes,
+) -> Response {
+    let ui = match parse_hub_ui_body(&body) {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid json: {e}") })),
+            )
+                .into_response()
+        }
+    };
+
+    let is_demo = query
+        .demo
+        .as_deref()
+        .is_some_and(|d| d == "1" || d.eq_ignore_ascii_case("true"));
+
+    if is_demo {
+        let ed = query
+            .edition
+            .as_deref()
+            .and_then(|s| s.parse::<Edition>().ok())
+            .unwrap_or_else(|| state.supervisor.edition());
+        let theme = query.theme.as_deref().unwrap_or("dark");
+        let lang = query.lang.as_deref().unwrap_or("zh-tw");
+        let (demo_status, demo_today, demo_logs) = bell_hub::build_demo_status(ed, theme, lang);
+        let patch = bell_hub::render_hub_patch(&HubRenderModel {
+            status: &demo_status,
+            today: Some(&demo_today),
+            logs: Some(&demo_logs),
+            ui: &ui,
+        });
+        return Json(patch).into_response();
+    }
+
+    let status = state.supervisor.status();
+    let need_today = matches!(ui.view.as_str(), "" | "overview" | "today") || ui.palette_open;
+    let today_val = if need_today {
+        Some(state.supervisor.today().await)
+    } else {
+        None
+    };
+    let logs_val = if ui.view == "logs" {
+        let logs_app = ui
+            .logs_app
+            .unwrap_or_else(|| status.edition.primary_app().unwrap_or(AppId::Personal));
+        Some(state.supervisor.logs(logs_app))
+    } else {
+        None
+    };
+
+    let patch = bell_hub::render_hub_patch(&HubRenderModel {
+        status: &status,
+        today: today_val.as_ref(),
+        logs: logs_val.as_ref(),
+        ui: &ui,
+    });
+    Json(patch).into_response()
+}
+
+async fn handle_in_memory_hub_css() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/css; charset=utf-8"),
+        )],
+        bell_hub::HUB_CSS,
+    )
+}
+
+async fn handle_in_memory_hub_js() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/javascript; charset=utf-8"),
+        )],
+        bell_hub::HUB_BOOT_JS,
+    )
+}
+
+async fn handle_in_memory_hub_index() -> impl IntoResponse {
+    Html(bell_hub::render_initial_html())
+}
+
+async fn handle_in_memory_favicon_svg() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("image/svg+xml; charset=utf-8"),
+        )],
+        bell_hub::FAVICON_SVG,
+    )
+}
+
+async fn handle_in_memory_favicon_ico() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("image/x-icon"))],
+        bell_hub::build_favicon_ico_bytes(),
+    )
+}
+
 async fn handle_open_workspace(
     State(state): State<DaemonState>,
     AxumPath(id_raw): AxumPath<String>,
+    headers: HeaderMap,
 ) -> Response {
+    if let Some(sfs) = headers.get("sec-fetch-site") {
+        let allowed = sfs
+            .to_str()
+            .ok()
+            .map(|v| {
+                let norm = v.trim().to_ascii_lowercase();
+                norm == "same-origin" || norm == "none"
+            })
+            .unwrap_or(false);
+        if !allowed {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "forbidden cross-site navigation" })),
+            )
+                .into_response();
+        }
+    }
+
     let Ok(app_id) = id_raw.parse::<AppId>() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -387,6 +533,7 @@ pub fn build_router(state: DaemonState, ui_dir: Option<&Path>) -> Router {
         .route("/api/health", get(handle_health))
         .route("/api/desktop/status", get(handle_status))
         .route("/api/desktop/today", get(handle_today))
+        .route("/api/desktop/hub-render", post(handle_hub_render))
         .route("/api/desktop/open/{id}", get(handle_open_workspace))
         .route("/api/desktop/activate", post(handle_activate))
         .route("/api/desktop/workspaces/start-all", post(handle_start_all))
@@ -399,17 +546,35 @@ pub fn build_router(state: DaemonState, ui_dir: Option<&Path>) -> Router {
         .route("/api/desktop/logs/{id}", get(handle_logs));
 
     let router = match ui_dir {
-        Some(dir) if dir.is_dir() => {
+        Some(dir) if dir.is_dir() && dir.join("index.html").is_file() => {
+            let mut api = if dir.join("hub.css").is_file() {
+                api
+            } else {
+                api.route("/hub.css", get(handle_in_memory_hub_css))
+            };
+            if !dir.join("favicon.svg").is_file() {
+                api = api.route("/favicon.svg", get(handle_in_memory_favicon_svg));
+            }
+            if !dir.join("favicon.ico").is_file() {
+                api = api.route("/favicon.ico", get(handle_in_memory_favicon_ico));
+            }
             let index = dir.join("index.html");
             let svc = ServeDir::new(dir).not_found_service(ServeFile::new(index));
             api.fallback_service(svc)
         }
-        _ => api.fallback(|| async {
-            (
-                StatusCode::NOT_FOUND,
-                Json::<Value>(json!({ "error": "not found" })),
-            )
-        }),
+        _ => api
+            .route("/", get(handle_in_memory_hub_index))
+            .route("/index.html", get(handle_in_memory_hub_index))
+            .route("/hub.css", get(handle_in_memory_hub_css))
+            .route("/hub.js", get(handle_in_memory_hub_js))
+            .route("/favicon.svg", get(handle_in_memory_favicon_svg))
+            .route("/favicon.ico", get(handle_in_memory_favicon_ico))
+            .fallback(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json::<Value>(json!({ "error": "not found" })),
+                )
+            }),
     };
 
     router
@@ -429,21 +594,20 @@ fn discover_default_ui_dir() -> Option<PathBuf> {
     }
     let mut candidates = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("desktop").join("ui").join("dist"));
-        candidates.push(cwd.join("ui").join("dist"));
+        candidates.push(cwd.join("desktop").join("hub-dist"));
+        candidates.push(cwd.join("hub-dist"));
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(p) = exe.parent() {
-            candidates.push(p.join("ui").join("dist"));
-            candidates.push(p.join("..").join("Resources").join("ui").join("dist"));
+            candidates.push(p.join("hub-dist"));
+            candidates.push(p.join("..").join("Resources").join("hub-dist"));
         }
     }
     candidates.push(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
-            .join("ui")
-            .join("dist"),
+            .join("hub-dist"),
     );
     candidates.into_iter().find(|p| p.is_dir())
 }
@@ -834,6 +998,35 @@ srv.listen(port, "127.0.0.1");
             .unwrap();
         assert_eq!(res_today.status(), StatusCode::OK);
 
+        // Enforce Sec-Fetch-Site guard on GET /api/desktop/open/{id}
+        for blocked_site in ["cross-site", "same-site"] {
+            let res_open_blocked = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/api/desktop/open/pr")
+                        .header("sec-fetch-site", blocked_site)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res_open_blocked.status(), StatusCode::FORBIDDEN);
+        }
+
+        for allowed_site in [Some("same-origin"), Some("none"), None] {
+            let mut req_builder = HttpRequest::builder().uri("/api/desktop/open/pr");
+            if let Some(val) = allowed_site {
+                req_builder = req_builder.header("sec-fetch-site", val);
+            }
+            let res_open_ok = app
+                .clone()
+                .oneshot(req_builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res_open_ok.status(), StatusCode::FOUND);
+        }
+
         let res_stop = app
             .oneshot(
                 HttpRequest::builder()
@@ -847,5 +1040,121 @@ srv.listen(port, "127.0.0.1");
             .unwrap();
         assert_eq!(res_stop.status(), StatusCode::OK);
         sup.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn hub_render_live_demo_and_in_memory_shell_work() {
+        let tmp = TempDir::new().unwrap();
+        let sup = Supervisor::new(SupervisorConfig {
+            edition: Edition::Suite,
+            base_port: 49300,
+            vault_dir: Some(tmp.path().join("vault")),
+            sidecars_dir: Some(tmp.path().join("sidecars")),
+            resource_dir: None,
+            allow_dev_fallback: false,
+            ready_timeout: Duration::from_secs(3),
+        })
+        .unwrap();
+
+        let state = DaemonState {
+            supervisor: sup,
+            allowed_origins: Arc::new(build_allowed_origins("127.0.0.1", 4600)),
+        };
+        let app = build_router(state, None);
+
+        // In-memory shell & CSS work even when hub-dist is absent on disk
+        let res_shell = app
+            .clone()
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res_shell.status(), StatusCode::OK);
+        let shell_html = to_bytes(res_shell.into_body(), 262_144).await.unwrap();
+        assert!(std::str::from_utf8(&shell_html).unwrap().contains("<!doctype html>"));
+
+        let res_css = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/hub.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_css.status(), StatusCode::OK);
+
+        let res_favicon = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/favicon.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_favicon.status(), StatusCode::OK);
+        assert!(res_favicon
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("image/svg+xml"));
+
+        // Enforce Origin check on POST /api/desktop/hub-render
+        let res_forbidden = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/desktop/hub-render")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_forbidden.status(), StatusCode::FORBIDDEN);
+
+        // Live hub-render
+        let res_live = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/desktop/hub-render")
+                    .header("origin", "http://127.0.0.1:4600")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"view":"overview","paletteOpen":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_live.status(), StatusCode::OK);
+        let live_patch: Value =
+            serde_json::from_slice(&to_bytes(res_live.into_body(), 262_144).await.unwrap())
+                .unwrap();
+        assert!(live_patch["html"].as_str().is_some());
+        assert!(live_patch["title"].as_str().is_some());
+
+        // Deterministic ?demo=1 hub-render
+        let res_demo = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/desktop/hub-render?demo=1&edition=explain&theme=light&lang=en")
+                    .header("origin", "http://127.0.0.1:4600")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ui":{"view":"today"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_demo.status(), StatusCode::OK);
+        let demo_patch: Value =
+            serde_json::from_slice(&to_bytes(res_demo.into_body(), 262_144).await.unwrap())
+                .unwrap();
+        assert!(demo_patch["html"].as_str().unwrap().contains("BELL Explain"));
     }
 }
