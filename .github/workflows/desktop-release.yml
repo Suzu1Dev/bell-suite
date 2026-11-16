@@ -366,7 +366,7 @@ jobs:
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
         run: |
-          node -e 'const fs=require("node:fs"),p=require("node:path");if(fs.existsSync("desktop/target")){for(const d of fs.readdirSync("desktop/target")){fs.rmSync(p.join("desktop/target",d,"release","bundle"),{recursive:true,force:true});}}'
+          node -e 'const fs=require("node:fs"),p=require("node:path");if(fs.existsSync("desktop/target")){for(const d of fs.readdirSync("desktop/target",{withFileTypes:true})){if(d.isDirectory())fs.rmSync(p.join("desktop/target",d.name,"release","bundle"),{recursive:true,force:true});}}'
           node desktop/scripts/generate-icons.mjs
           node desktop/scripts/prepare-edition.mjs ${{ matrix.edition }} --stage-resources --apply
 
