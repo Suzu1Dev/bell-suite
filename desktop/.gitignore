@@ -1,0 +1,6 @@
+target/
+dist-sidecars/
+editions/.staged/
+crates/bell-tauri/gen/
+ui/node_modules/
+ui/dist/

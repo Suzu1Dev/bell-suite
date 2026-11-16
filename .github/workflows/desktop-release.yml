@@ -1,0 +1,459 @@
+name: BELL Desktop Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "desktop-v*"
+  pull_request:
+    paths:
+      - "desktop/**"
+      - "contracts/**"
+      - ".github/workflows/desktop-release.yml"
+  workflow_dispatch:
+    inputs:
+      edition:
+        description: "Edition to build (all, suite, personal, explain, pr, reader, campaign)"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - suite
+          - personal
+          - explain
+          - pr
+          - reader
+          - campaign
+
+permissions:
+  contents: read
+
+env:
+  NODE_RUNTIME_VERSION: "22.22.1"
+
+jobs:
+  prepare-bundles:
+    name: Bundle & Verify 5 Sidecars + UI Shell
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bell-suite
+        uses: actions/checkout@v4
+        with:
+          path: bell-suite
+
+      - name: Checkout BELL Personal
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/BELL-Personal
+          path: bell-personal
+
+      - name: Checkout BELL Explain
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/BELL-Explain
+          path: bell-explain
+
+      - name: Checkout BELL PR
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/bell-pr
+          path: bell-pr
+
+      - name: Checkout BELL Web Reader
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/bell-reader
+          path: bell-reader
+
+      - name: Checkout BELL Campaign
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/bell-campaign
+          path: bell-campaign
+
+      - name: Setup Node.js v${{ env.NODE_RUNTIME_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_RUNTIME_VERSION }}
+
+      - name: Verify BELL Suite contract & CLI test suite
+        working-directory: bell-suite
+        run: npm test
+
+      - name: Install & build all 5 workspace frontends
+        run: |
+          set -euo pipefail
+          for app_dir in bell-personal bell-explain bell-pr bell-reader bell-campaign; do
+            echo "::group::Building ${app_dir}"
+            if [ -f "${app_dir}/package-lock.json" ]; then
+              npm --prefix "${app_dir}" ci --no-audit --no-fund
+            else
+              npm --prefix "${app_dir}" install --no-audit --no-fund
+            fi
+            npm --prefix "${app_dir}" run build
+            echo "::endgroup::"
+          done
+
+      - name: Build & test BELL Desktop UI shell
+        working-directory: bell-suite/desktop/ui
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+          npm test
+          npm run build
+
+      - name: Generate edition icons & smoke-verify zero-node_modules sidecars
+        working-directory: bell-suite
+        env:
+          BELL_SUITE_APP_PERSONAL: ${{ github.workspace }}/bell-personal
+          BELL_SUITE_APP_EXPLAIN: ${{ github.workspace }}/bell-explain
+          BELL_SUITE_APP_PR: ${{ github.workspace }}/bell-pr
+          BELL_SUITE_APP_READER: ${{ github.workspace }}/bell-reader
+          BELL_SUITE_APP_CAMPAIGN: ${{ github.workspace }}/bell-campaign
+        run: |
+          node desktop/scripts/generate-icons.mjs
+          node desktop/scripts/bundle-sidecars.mjs --verify
+          node desktop/scripts/prepare-edition.mjs all
+
+      - name: Upload bundled sidecar apps
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-sidecars-apps
+          path: bell-suite/desktop/dist-sidecars/apps
+          retention-days: 7
+
+      - name: Upload built Desktop UI dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-ui-dist
+          path: bell-suite/desktop/ui/dist
+          retention-days: 7
+
+  create-release:
+    name: Create Unified Draft Release
+    needs: prepare-bundles
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/desktop-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.release.outputs.release_id }}
+    steps:
+      - name: Create or reuse draft GitHub Release for ${{ github.ref_name }}
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tagName = context.ref.replace(/^refs\/tags\//, "");
+            const { owner, repo } = context.repo;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+            let existing = releases.find((r) => r.tag_name === tagName);
+            if (!existing) {
+              const isPreviewTag = tagName.startsWith("desktop-v");
+              const created = await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tagName,
+                name: `BELL Desktop ${tagName}`,
+                body: [
+                  "Native macOS Universal (`.dmg`, `.app.tar.gz`) and Windows x64 (`.msi`, `-setup.exe`) installers for **BELL Suite** and all 5 standalone workspaces (**Personal**, **Explain**, **PR**, **Web Reader**, **Campaign**).",
+                  "",
+                  "- Embedded SHA-256 verified Node.js `v22.22.1` LTS runtime (`bell-runtime`) — zero external Node installation required.",
+                  "- **macOS first-launch tip (unsigned preview)**: drag the app to `/Applications`, then run `xattr -cr \"/Applications/BELL Suite.app\"` (or right-click → Open) if Gatekeeper prompts.",
+                ].join("\n"),
+                draft: !isPreviewTag,
+                prerelease: isPreviewTag,
+              });
+              existing = created.data;
+            }
+            core.info(`Using GitHub Release id=${existing.id} for tag=${tagName}`);
+            core.setOutput("release_id", String(existing.id));
+
+  build-installers:
+    name: Build ${{ matrix.edition }} (${{ matrix.platform.os_label }})
+    needs:
+      - prepare-bundles
+      - create-release
+    if: >-
+      always() &&
+      needs.prepare-bundles.result == 'success' &&
+      (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') &&
+      (github.event.inputs.edition == '' || github.event.inputs.edition == 'all' || github.event.inputs.edition == matrix.edition) &&
+      (github.event_name != 'pull_request' || matrix.edition == 'suite')
+    runs-on: ${{ matrix.platform.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        edition:
+          - suite
+          - personal
+          - explain
+          - pr
+          - reader
+          - campaign
+        platform:
+          - os: macos-latest
+            os_label: macos-universal
+            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+            tauri_args: "--target universal-apple-darwin"
+          - os: windows-latest
+            os_label: windows-x64
+            rust_targets: "x86_64-pc-windows-msvc"
+            tauri_args: "--target x86_64-pc-windows-msvc"
+
+    steps:
+      - name: Checkout bell-suite
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js v${{ env.NODE_RUNTIME_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_RUNTIME_VERSION }}
+
+      - name: Install Tauri CLI v2
+        run: npm install -g @tauri-apps/cli@^2
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.rust_targets }}
+
+      - name: Cache Rust workspace target
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "desktop -> target"
+          key: ${{ matrix.platform.os_label }}
+
+      - name: Download bundled sidecar apps
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-sidecars-apps
+          path: desktop/dist-sidecars/apps
+
+      - name: Download Desktop UI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-ui-dist
+          path: desktop/ui/dist
+
+      - name: Embed & codesign official Node v${{ env.NODE_RUNTIME_VERSION }} Universal runtime (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          VER="${NODE_RUNTIME_VERSION}"
+          BASE_URL="https://nodejs.org/dist/v${VER}"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "${TMP_DIR}"' EXIT
+
+          pushd "${TMP_DIR}" >/dev/null
+          curl -fsSLO "${BASE_URL}/SHASUMS256.txt"
+          curl -fsSLO "${BASE_URL}/node-v${VER}-darwin-arm64.tar.gz"
+          curl -fsSLO "${BASE_URL}/node-v${VER}-darwin-x64.tar.gz"
+
+          grep -E "  node-v${VER}-darwin-(arm64|x64)\.tar\.gz$" SHASUMS256.txt | shasum -a 256 -c -
+
+          tar -xzf "node-v${VER}-darwin-arm64.tar.gz"
+          tar -xzf "node-v${VER}-darwin-x64.tar.gz"
+
+          mkdir -p "${GITHUB_WORKSPACE}/desktop/dist-sidecars/bin"
+          lipo -create \
+            "node-v${VER}-darwin-arm64/bin/node" \
+            "node-v${VER}-darwin-x64/bin/node" \
+            -output "${GITHUB_WORKSPACE}/desktop/dist-sidecars/bin/bell-runtime"
+          popd >/dev/null
+
+          chmod 0755 desktop/dist-sidecars/bin/bell-runtime
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            codesign --force --sign "${APPLE_SIGNING_IDENTITY}" --timestamp --options runtime \
+              --entitlements desktop/editions/entitlements.macos.plist \
+              desktop/dist-sidecars/bin/bell-runtime
+          else
+            codesign --force --sign - --timestamp=none \
+              --entitlements desktop/editions/entitlements.macos.plist \
+              desktop/dist-sidecars/bin/bell-runtime
+          fi
+
+          lipo -archs desktop/dist-sidecars/bin/bell-runtime
+          ./desktop/dist-sidecars/bin/bell-runtime --version
+
+      - name: Embed official Node v${{ env.NODE_RUNTIME_VERSION }} x64 runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = $env:NODE_RUNTIME_VERSION
+          $baseUrl = "https://nodejs.org/dist/v$ver"
+          $zipName = "node-v$ver-win-x64.zip"
+          $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("bell-node-" + [System.Guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+
+          try {
+            $shasumsPath = Join-Path $tmpDir "SHASUMS256.txt"
+            $zipPath = Join-Path $tmpDir $zipName
+            Invoke-WebRequest -Uri "$baseUrl/SHASUMS256.txt" -OutFile $shasumsPath
+            Invoke-WebRequest -Uri "$baseUrl/$zipName" -OutFile $zipPath
+
+            $expectedLine = Select-String -Path $shasumsPath -Pattern "  $([regex]::Escape($zipName))$" | Select-Object -First 1
+            if (-not $expectedLine) { throw "Missing checksum for $zipName in SHASUMS256.txt" }
+            $expectedHash = ($expectedLine.Line -split '\s+')[0].ToLowerInvariant()
+            $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHash) {
+              throw "SHA-256 mismatch for ${zipName}: expected $expectedHash, got $actualHash"
+            }
+
+            Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
+            $binDir = Join-Path $env:GITHUB_WORKSPACE "desktop\dist-sidecars\bin"
+            New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+            $runtimeExe = Join-Path $binDir "bell-runtime.exe"
+            Copy-Item -Path (Join-Path $tmpDir "node-v$ver-win-x64\node.exe") -Destination $runtimeExe -Force
+            & $runtimeExe --version
+          } finally {
+            Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+          }
+
+      - name: Generate icons & stage edition config (${{ matrix.edition }})
+        run: |
+          node desktop/scripts/generate-icons.mjs
+          node desktop/scripts/prepare-edition.mjs ${{ matrix.edition }} --stage-resources --apply
+
+      - name: Check Apple code-signing certificate availability
+        id: apple_cert
+        env:
+          CERT_PRESENT: ${{ secrets.APPLE_CERTIFICATE }}
+        shell: bash
+        run: |
+          if [ -n "${CERT_PRESENT:-}" ]; then
+            echo "has_cert=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "has_cert=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Build Tauri v2 installer (PR / Dispatch)
+        if: ${{ needs.create-release.outputs.release_id == '' }}
+        uses: tauri-apps/tauri-action@v0
+        env:
+          BELL_DESKTOP_EDITION: ${{ matrix.edition }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
+        with:
+          projectPath: desktop/crates/bell-tauri
+          tauriScript: tauri
+          includeUpdaterJson: false
+          args: ${{ matrix.platform.tauri_args }}
+
+      - name: Build & Upload Tauri v2 Release Assets (Tag — Unsigned / Ad-hoc Preview)
+        if: ${{ needs.create-release.outputs.release_id != '' && steps.apple_cert.outputs.has_cert != 'true' }}
+        uses: tauri-apps/tauri-action@v0
+        env:
+          BELL_DESKTOP_EDITION: ${{ matrix.edition }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
+        with:
+          projectPath: desktop/crates/bell-tauri
+          tauriScript: tauri
+          includeUpdaterJson: false
+          args: ${{ matrix.platform.tauri_args }}
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+
+      - name: Build & Upload Tauri v2 Release Assets (Tag — Developer ID Signed & Notarized)
+        if: ${{ needs.create-release.outputs.release_id != '' && steps.apple_cert.outputs.has_cert == 'true' }}
+        uses: tauri-apps/tauri-action@v0
+        env:
+          BELL_DESKTOP_EDITION: ${{ matrix.edition }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: desktop/crates/bell-tauri
+          tauriScript: tauri
+          includeUpdaterJson: false
+          args: ${{ matrix.platform.tauri_args }}
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+
+      - name: Package macOS .app bundle into .app.tar.gz
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for app_bundle in desktop/target/*/release/bundle/macos/*.app; do
+            bundle_dir="$(dirname "${app_bundle}")"
+            app_base="$(basename "${app_bundle}" .app)"
+            slug="$(printf '%s' "${app_base}" | tr ' ' '-')"
+            archive="${bundle_dir}/${slug}-macos-universal.app.tar.gz"
+            tar -czf "${archive}" -C "${bundle_dir}" "$(basename "${app_bundle}")"
+            echo "Packaged ${archive}"
+          done
+
+      - name: Upload macOS .app.tar.gz to unified GitHub Release
+        if: ${{ runner.os == 'macOS' && needs.create-release.outputs.release_id != '' }}
+        uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const releaseId = Number(process.env.RELEASE_ID);
+            const { owner, repo } = context.repo;
+
+            const globDir = path.join(process.cwd(), "desktop", "target", "universal-apple-darwin", "release", "bundle", "macos");
+            if (!fs.existsSync(globDir)) {
+              core.setFailed(`Expected bundle directory missing: ${globDir}`);
+              return;
+            }
+            const archives = fs.readdirSync(globDir).filter((f) => f.endsWith("-macos-universal.app.tar.gz"));
+            if (archives.length === 0) {
+              core.setFailed(`No .app.tar.gz archive found in ${globDir}`);
+              return;
+            }
+
+            const existingAssets = await github.rest.repos.listReleaseAssets({ owner, repo, release_id: releaseId, per_page: 100 });
+            for (const name of archives) {
+              const prev = existingAssets.data.find((a) => a.name === name);
+              if (prev) {
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: prev.id });
+              }
+              const data = fs.readFileSync(path.join(globDir, name));
+              await github.rest.repos.uploadReleaseAsset({
+                owner,
+                repo,
+                release_id: releaseId,
+                name,
+                headers: {
+                  "content-type": "application/gzip",
+                  "content-length": data.length,
+                },
+                data,
+              });
+              core.info(`Uploaded ${name} (${data.length} bytes) to release ${releaseId}`);
+            }
+
+      - name: Upload installer artifacts (${{ matrix.edition }} - ${{ matrix.platform.os_label }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: bell-${{ matrix.edition }}-${{ matrix.platform.os_label }}
+          path: |
+            desktop/target/*/release/bundle/dmg/*.dmg
+            desktop/target/*/release/bundle/macos/*-macos-universal.app.tar.gz
+            desktop/target/*/release/bundle/msi/*.msi
+            desktop/target/*/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
