@@ -495,7 +495,7 @@ jobs:
             console.log(
               `VERIFIED macOS WKWebView DOM (${report.edition}): height=${renderedHeight}px, textLength=${report.domReady.textLength}, sidecars=${report.healthyRunningWorkspaces}/${report.installedWorkspaces}`,
             );
-            EOF
+          EOF
 
             echo "=== 2/2 Compiling CoreGraphics stopwatch & measuring Cold + Warm NSWindow open latency ==="
             cat > "${BENCH_SWIFT}" <<'SWIFT'
@@ -605,7 +605,7 @@ jobs:
               fputs("ERROR: WARM_WINDOW_OPEN_MS (\(warmMs)ms) exceeded 2000ms gate!\n", stderr)
               exit(1)
             }
-            SWIFT
+          SWIFT
 
             # Pre-compile Swift stopwatch binary BEFORE starting any launch timer
             swiftc -O "${BENCH_SWIFT}" -o "${BENCH_BIN}"
