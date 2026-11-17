@@ -14,8 +14,9 @@ pub use supervisor::{
     WorkspaceLogs, WorkspaceState, WorkspaceStatus,
 };
 pub use vault::{
-    default_vault_root, ensure_pr_api_token_at_root, read_pr_api_token_at_root, DesktopPrefs,
-    PrefsPatch, Vault, VaultBackupResult, VaultDatabase, VaultError, VaultStatus,
+    default_vault_root, ensure_personal_master_key_at_root, ensure_pr_api_token_at_root,
+    read_personal_master_key_at_root, read_pr_api_token_at_root, DesktopPrefs, PrefsPatch, Vault,
+    VaultBackupResult, VaultDatabase, VaultError, VaultStatus,
 };
 
 #[cfg(test)]
@@ -229,10 +230,27 @@ mod tests {
             ports.insert(app, app.default_port());
         }
 
+        let personal_key = ensure_personal_master_key_at_root(tmp.path()).unwrap();
+        assert_eq!(personal_key.len(), 44);
+        assert!(personal_key.ends_with('='));
+        assert_eq!(
+            ensure_personal_master_key_at_root(tmp.path()).unwrap(),
+            personal_key,
+            "existing master key must remain stable across restarts"
+        );
+
         let personal_env = build_suite_env(AppId::Personal, &ports, "127.0.0.1", tmp.path());
         assert_eq!(personal_env.get("HOST").unwrap(), "127.0.0.1");
         assert_eq!(personal_env.get("PORT").unwrap(), "4601");
         assert_eq!(personal_env.get("BELLPERSONAL_PORT").unwrap(), "4601");
+        assert_eq!(
+            personal_env.get("BELLPERSONAL_MASTER_KEY").unwrap(),
+            &personal_key
+        );
+        assert_eq!(
+            personal_env.get("BELLPERSONAL_SECRETS_DIR").unwrap(),
+            &tmp.path().join("personal-secrets").to_string_lossy().into_owned()
+        );
         assert_eq!(personal_env.get("BELL_NO_OPEN").unwrap(), "1");
         assert_eq!(personal_env.get("BELLPR_NO_OPEN").unwrap(), "1");
         assert_eq!(

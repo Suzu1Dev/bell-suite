@@ -693,6 +693,9 @@ fn main() {
             let pr_init_js = build_pr_origin_guarded_init_script(&pr_token, initial_pr_port);
             let nav_handle = app.handle().clone();
             let sup_for_new_win = supervisor.clone();
+            let pending_oauth_reload = Arc::new(AtomicBool::new(false));
+            let pending_oauth_nav = pending_oauth_reload.clone();
+            let pending_oauth_new = pending_oauth_reload.clone();
 
             let mut win_builder = tauri::WebviewWindowBuilder::new(
                 app,
@@ -706,8 +709,23 @@ fn main() {
             .visible(true)
             .focused(true)
             .theme(parse_tauri_theme(&initial_theme))
+            .on_navigation(move |url| {
+                let is_external_oauth = (url.scheme() == "http" || url.scheme() == "https")
+                    && (url.host_str() == Some("accounts.google.com")
+                        || (matches!(url.host_str(), Some("127.0.0.1" | "localhost"))
+                            && url.path().starts_with("/oauth/")));
+                if is_external_oauth {
+                    pending_oauth_nav.store(true, Ordering::SeqCst);
+                    open_external_browser(url.as_str());
+                    return false;
+                }
+                true
+            })
             .on_new_window(move |url, _features| {
-                let is_workspace_url = (url.scheme() == "http" || url.scheme() == "https")
+                let is_oauth = url.host_str() == Some("accounts.google.com")
+                    || url.path().starts_with("/oauth/");
+                let is_workspace_url = !is_oauth
+                    && (url.scheme() == "http" || url.scheme() == "https")
                     && matches!(url.host_str(), Some("127.0.0.1" | "localhost"))
                     && url.port().is_some_and(|p| {
                         sup_for_new_win
@@ -725,6 +743,9 @@ fn main() {
                         }
                     });
                 } else if matches!(url.scheme(), "http" | "https") {
+                    if is_oauth {
+                        pending_oauth_new.store(true, Ordering::SeqCst);
+                    }
                     open_external_browser(url.as_str());
                 }
                 NewWindowResponse::Deny
@@ -736,13 +757,19 @@ fn main() {
 
             let window = win_builder.build()?;
 
-            #[cfg(target_os = "macos")]
             {
-                let win_for_close = window.clone();
+                let win_for_events = window.clone();
+                let pending_oauth_focus = pending_oauth_reload.clone();
                 window.on_window_event(move |event| {
+                    #[cfg(target_os = "macos")]
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
-                        let _ = win_for_close.hide();
+                        let _ = win_for_events.hide();
+                    }
+                    if let tauri::WindowEvent::Focused(true) = event {
+                        if pending_oauth_focus.swap(false, Ordering::SeqCst) {
+                            let _ = win_for_events.eval("window.location.reload()");
+                        }
                     }
                 });
             }

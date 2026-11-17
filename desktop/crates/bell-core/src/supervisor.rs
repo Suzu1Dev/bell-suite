@@ -831,7 +831,17 @@ impl Supervisor {
         if id == AppId::Pr {
             let _ = self.vault.ensure_pr_initial_store();
         }
-        let suite_env = build_suite_env(id, &ports_by_app, "127.0.0.1", self.vault.root_dir());
+        let explicit_personal_key = std::env::var("BELLPERSONAL_MASTER_KEY")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        if id == AppId::Personal && explicit_personal_key.is_none() {
+            let _ = crate::vault::ensure_personal_master_key_at_root(self.vault.root_dir());
+        }
+        let mut suite_env = build_suite_env(id, &ports_by_app, "127.0.0.1", self.vault.root_dir());
+        if let Some(explicit_key) = explicit_personal_key {
+            suite_env.insert("BELLPERSONAL_MASTER_KEY".into(), explicit_key);
+        }
 
         let mut cmd = match source {
             AppLaunchSource::Sidecar { dir, entry } => {

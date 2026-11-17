@@ -621,6 +621,100 @@ pub fn ensure_pr_api_token_at_root(vault_root: &Path) -> std::io::Result<String>
     Ok(tok)
 }
 
+const B64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn encode_base64_32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(44);
+    let mut i = 0;
+    while i < 30 {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
+        out.push(B64_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(B64_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(B64_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        out.push(B64_ALPHABET[(n & 0x3f) as usize] as char);
+        i += 3;
+    }
+    let b30 = bytes[30] as u32;
+    let b31 = bytes[31] as u32;
+    out.push(B64_ALPHABET[(b30 >> 2) as usize] as char);
+    out.push(B64_ALPHABET[(((b30 & 0x03) << 4) | (b31 >> 4)) as usize] as char);
+    out.push(B64_ALPHABET[((b31 & 0x0f) << 2) as usize] as char);
+    out.push('=');
+    out
+}
+
+fn is_valid_base64_32(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 44 || b[43] != b'=' {
+        return false;
+    }
+    let is_b64_char = |c: u8| c.is_ascii_alphanumeric() || c == b'+' || c == b'/';
+    if !b[..42].iter().copied().all(is_b64_char) {
+        return false;
+    }
+    // Canonical 32-byte Base64 requires the two padding bits in char 42 to be zero.
+    matches!(
+        b[42],
+        b'A' | b'E'
+            | b'I'
+            | b'M'
+            | b'Q'
+            | b'U'
+            | b'Y'
+            | b'c'
+            | b'g'
+            | b'k'
+            | b'o'
+            | b's'
+            | b'w'
+            | b'0'
+            | b'4'
+            | b'8'
+    )
+}
+
+pub fn read_personal_master_key_at_root(vault_root: &Path) -> Option<String> {
+    let key_path = vault_root.join("personal-secrets").join("master.key");
+    let raw = fs::read_to_string(key_path).ok()?;
+    let trimmed = raw.trim();
+    if is_valid_base64_32(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// Ensures `<vault_root>/personal-secrets/master.key` (32-byte canonical Base64) exists
+/// outside `<vault_root>/personal` so SQLite backups never carry credential secrets.
+pub fn ensure_personal_master_key_at_root(vault_root: &Path) -> std::io::Result<String> {
+    if let Some(existing) = read_personal_master_key_at_root(vault_root) {
+        return Ok(existing);
+    }
+    let secrets_dir = vault_root.join("personal-secrets");
+    fs::create_dir_all(&secrets_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&secrets_dir, fs::Permissions::from_mode(0o700));
+    }
+    let key_path = secrets_dir.join("master.key");
+
+    let mut random_bytes = [0u8; 32];
+    getrandom::getrandom(&mut random_bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let encoded = encode_base64_32(&random_bytes);
+
+    let tmp_path = secrets_dir.join(format!("master.key.tmp-{}", std::process::id()));
+    fs::write(&tmp_path, format!("{encoded}\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(&tmp_path, &key_path)?;
+    Ok(encoded)
+}
+
 fn collect_pr_json_stores(pr_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for &file_name in PR_JSON_STORE_FILES {

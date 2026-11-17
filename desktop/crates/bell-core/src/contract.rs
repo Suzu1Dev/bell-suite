@@ -999,6 +999,14 @@ pub fn build_suite_env(
             if !personal_fetch.is_empty() {
                 env.insert("BELLPERSONAL_SUITE_FETCH".into(), personal_fetch);
             }
+            let personal_secrets_dir = vault_root.join("personal-secrets");
+            env.insert(
+                "BELLPERSONAL_SECRETS_DIR".into(),
+                personal_secrets_dir.to_string_lossy().into_owned(),
+            );
+            if let Some(key) = crate::vault::read_personal_master_key_at_root(vault_root) {
+                env.insert("BELLPERSONAL_MASTER_KEY".into(), key);
+            }
         }
         AppId::Explain => {
             env.insert("BELL_HOST".into(), host.into());

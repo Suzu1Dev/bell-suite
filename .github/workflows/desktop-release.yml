@@ -198,7 +198,8 @@ jobs:
                 body: [
                   "Native macOS **Apple Silicon (`_aarch64.dmg` / `_aarch64.app.tar.gz`)**, **Intel (`_x64.dmg` / `_x64.app.tar.gz`)**, and **Windows x64 (`.msi` / `-setup.exe`)** installers for **BELL Suite** and all 5 standalone workspaces (**Personal**, **Explain**, **PR**, **Web Reader**, **Campaign**).",
                   "",
-                  "- **Instant macOS Launch (`v1.0.4`)**: single-archive `apps.tar.gz` sidecar bundle (`<= 6` sealed files in `CodeResources`) + stripped native `arm64`/`x64` Mach-O binaries (`bell-desktop` + `bell-runtime`).",
+                  "- **Instant macOS Launch (`v1.0.5`)**: single-archive `apps.tar.gz` sidecar bundle (`4` sealed files in `CodeResources`) + stripped native `arm64`/`x64` Mach-O binaries (`bell-desktop` + `bell-runtime`).",
+                  "- **Auto-Provisioned Personal Vault & System-Browser Google OAuth (`v1.0.5`)**: automatically generates a persistent local 256-bit AES-GCM master key (`personal-secrets/master.key`, `0600`) for Google, E3, Canvas, private calendars, and saved API keys, and opens `/oauth/*` flows in the system browser.",
                   "- **Pure-Rust `bell-hub` Shell**: standard `WebviewWindow`, zero TypeScript, built-in `SuiteSwitcher` + `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5`.",
                   "- **Embedded Node.js `v22.22.1` LTS Runtime**: SHA-256 verified — zero external Node installation required.",
                   "- **macOS first-launch tip (unsigned preview)**: drag the app to `/Applications`, then run `xattr -cr \"/Applications/BELL Suite.app\"` (or right-click → Open) if Gatekeeper prompts.",
