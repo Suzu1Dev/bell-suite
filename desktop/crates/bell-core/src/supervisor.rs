@@ -329,6 +329,24 @@ impl Supervisor {
 
         if unpack_apps_archive(&archive_path, &cache_dir).is_ok() {
             let _ = fs::write(&ready_marker, env!("CARGO_PKG_VERSION"));
+            // Reclaim stale <edition>-<old_version> caches after a version upgrade
+            if let Some(cache_parent) = cache_dir.parent() {
+                let prefix = format!("{}-", self.config.edition.as_str());
+                if let Ok(entries) = fs::read_dir(cache_parent) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p != cache_dir
+                            && p.is_dir()
+                            && entry
+                                .file_name()
+                                .to_str()
+                                .is_some_and(|n| n.starts_with(&prefix))
+                        {
+                            let _ = fs::remove_dir_all(p);
+                        }
+                    }
+                }
+            }
             *unpacked = true;
         }
     }

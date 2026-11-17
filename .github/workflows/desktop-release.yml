@@ -198,8 +198,9 @@ jobs:
                 body: [
                   "Native macOS **Apple Silicon (`_aarch64.dmg` / `_aarch64.app.tar.gz`)**, **Intel (`_x64.dmg` / `_x64.app.tar.gz`)**, and **Windows x64 (`.msi` / `-setup.exe`)** installers for **BELL Suite** and all 5 standalone workspaces (**Personal**, **Explain**, **PR**, **Web Reader**, **Campaign**).",
                   "",
-                  "- **Instant macOS Launch (`v1.0.5`)**: single-archive `apps.tar.gz` sidecar bundle (`4` sealed files in `CodeResources`) + stripped native `arm64`/`x64` Mach-O binaries (`bell-desktop` + `bell-runtime`).",
-                  "- **Auto-Provisioned Personal Vault & System-Browser Google OAuth (`v1.0.5`)**: automatically generates a persistent local 256-bit AES-GCM master key (`personal-secrets/master.key`, `0600`) for Google, E3, Canvas, private calendars, and saved API keys, and opens `/oauth/*` flows in the system browser.",
+                  "- **Instant macOS Launch (`v1.0.6`)**: single-archive `apps.tar.gz` sidecar bundle (`4` sealed files in `CodeResources`) + stripped native `arm64`/`x64` Mach-O binaries (`bell-desktop` + `bell-runtime`).",
+                  "- **Full Offline PDF Parsing & macOS PDFKit Page Rendering (`v1.0.6`)**: embeds `pdfjs-dist` worker directly into `BELL Explain`'s isolated `document-worker` and renders diagram/scanned PDF pages natively on macOS via CoreGraphics `PDFKit`.",
+                  "- **Auto-Provisioned Personal Vault & System-Browser Google OAuth (`v1.0.6`)**: automatically generates a persistent local 256-bit AES-GCM master key (`personal-secrets/master.key`, `0600`) for Google, E3, Canvas, private calendars, and saved API keys, and opens `/oauth/*` flows in the system browser.",
                   "- **Pure-Rust `bell-hub` Shell**: standard `WebviewWindow`, zero TypeScript, built-in `SuiteSwitcher` + `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5`.",
                   "- **Embedded Node.js `v22.22.1` LTS Runtime**: SHA-256 verified — zero external Node installation required.",
                   "- **macOS first-launch tip (unsigned preview)**: drag the app to `/Applications`, then run `xattr -cr \"/Applications/BELL Suite.app\"` (or right-click → Open) if Gatekeeper prompts.",
@@ -497,6 +498,61 @@ jobs:
               `VERIFIED macOS WKWebView DOM (${report.edition}): height=${renderedHeight}px, textLength=${report.domReady.textLength}, sidecars=${report.healthyRunningWorkspaces}/${report.installedWorkspaces}`,
             );
           EOF
+
+            if [ "${{ matrix.edition }}" = "suite" ] || [ "${{ matrix.edition }}" = "explain" ]; then
+              echo "=== Verifying BELL Explain PDF parse + macOS PDFKit page render from extracted runtime-cache ==="
+              node --input-type=module - "${SELFTEST_VAULT}" "${{ matrix.edition }}" <<'EOF'
+              import { fork } from "node:child_process";
+              import fs from "node:fs";
+              import path from "node:path";
+
+              const [vaultDir, edition] = process.argv.slice(2);
+              const cacheRoot = path.join(vaultDir, "runtime-cache");
+              const cacheDir = fs.readdirSync(cacheRoot).find((d) => d.startsWith(`${edition}-`));
+              if (!cacheDir) throw new Error(`Missing extracted runtime-cache under ${cacheRoot}`);
+              const workerCjs = path.join(cacheRoot, cacheDir, "apps", "explain", "document-worker.cjs");
+              const samplePdf = path.join(vaultDir, "ci-sample.pdf");
+              fs.writeFileSync(samplePdf, [
+                "%PDF-1.4",
+                "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj",
+                "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj",
+                "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj",
+                "4 0 obj << /Length 44 >> stream",
+                "BT /F1 18 Tf 72 720 Td (Hello BELL Explain) Tj ET",
+                "endstream endobj",
+                "5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj",
+                "xref",
+                "0 6",
+                "0000000000 65535 f ",
+                "0000000009 00000 n ",
+                "0000000058 00000 n ",
+                "0000000115 00000 n ",
+                "0000000229 00000 n ",
+                "0000000322 00000 n ",
+                "trailer << /Size 6 /Root 1 0 R >>",
+                "startxref",
+                "390",
+                "%%EOF",
+              ].join("\n"));
+
+              const runCmd = (req) => new Promise((resolve, reject) => {
+                const child = fork(workerCjs, [], { cwd: "/tmp", stdio: ["ignore", "pipe", "pipe", "ipc"] });
+                child.on("message", (msg) => msg.error ? reject(new Error(JSON.stringify(msg.error))) : resolve(msg.result));
+                child.on("error", reject);
+                child.on("spawn", () => child.send(req));
+              });
+
+              const parsed = await runCmd({ command: "parse", path: samplePdf, format: "pdf" });
+              if (!parsed.units?.length || !parsed.units[0].text.includes("Hello BELL Explain")) {
+                throw new Error(`Unexpected PDF parse output: ${JSON.stringify(parsed)}`);
+              }
+              const rendered = await runCmd({ command: "render", path: samplePdf, required: [1], candidates: [], limit: 1, maxEdge: 800 });
+              if (!rendered.length || !rendered[0].data?.startsWith("iVBORw0KGgo")) {
+                throw new Error(`macOS PDFKit render failed: ${JSON.stringify(rendered)}`);
+              }
+              console.log(`VERIFIED macOS BELL Explain PDF parse (${parsed.extractedChars} chars) + PDFKit PNG render (${rendered[0].width}x${rendered[0].height})`);
+          EOF
+            fi
 
             echo "=== 2/2 Compiling CoreGraphics stopwatch & measuring Cold + Warm NSWindow open latency ==="
             cat > "${BENCH_SWIFT}" <<'SWIFT'

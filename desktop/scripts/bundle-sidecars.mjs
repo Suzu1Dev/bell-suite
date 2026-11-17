@@ -267,12 +267,13 @@ module.exports = new Proxy({}, {
       }));
 
       if (spec.id === "explain") {
-        // Point pdfjs static asset lookup & forked document worker to bundled assets
+        // Point pdfjs static asset lookup, embedded pdf.worker, & forked document worker to bundled assets
         const appTsPath = path.join(appDir, "server", "app.ts");
         const parserTsPath = path.join(appDir, "server", "document-parser.ts");
         const workerTsPath = path.join(appDir, "server", "document-worker.ts");
+        const documentsTsPath = path.join(appDir, "server", "documents.ts");
 
-        build.onLoad({ filter: /server[\\/](app|document-parser|document-worker)\.ts$/ }, (args) => {
+        build.onLoad({ filter: /server[\\/](app|document-parser|document-worker|documents)\.ts$/ }, (args) => {
           let src = readFileSync(args.path, "utf8");
           if (path.resolve(args.path) === appTsPath) {
             src = src.replace(
@@ -290,9 +291,93 @@ module.exports = new Proxy({}, {
                 '["--max-old-space-size=512", "--disable-proto=throw"]',
               );
           } else if (path.resolve(args.path) === workerTsPath) {
+            const macPdfKitHelper = `
+import { execFileSync as __bellExecFileSync } from "node:child_process";
+function __bellRenderPdfPageDarwin(pdfPath: string, pageNum: number, width: number, height: number, password?: string): { mimeType: string; data: string } {
+  const jxa = [
+    'ObjC.import("Foundation");ObjC.import("AppKit");ObjC.import("Quartz");',
+    'const env=$.NSProcessInfo.processInfo.environment;',
+    'const p=ObjC.unwrap(env.objectForKey("BELL_PDF_PATH"));',
+    'const pwObj=env.objectForKey("BELL_PDF_PWD");const pw=pwObj.isNil()?"":ObjC.unwrap(pwObj);',
+    'const pgNum=Number(ObjC.unwrap(env.objectForKey("BELL_PDF_PAGE")));',
+    'const w=Number(ObjC.unwrap(env.objectForKey("BELL_PDF_W")));',
+    'const h=Number(ObjC.unwrap(env.objectForKey("BELL_PDF_H")));',
+    'const doc=$.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(p));',
+    'if(doc.isNil())throw new Error("PDF open failed");',
+    'if(doc.isLocked&&(!pw||!doc.unlockWithPassword(pw)))throw new Error("PDF locked");',
+    'const pg=doc.pageAtIndex(pgNum-1);if(pg.isNil())throw new Error("Page missing");',
+    'const img=pg.thumbnailOfSizeForBox($.NSMakeSize(w,h),$.kPDFDisplayBoxMediaBox);',
+    'const rep=$.NSBitmapImageRep.imageRepWithData(img.TIFFRepresentation);',
+    'let out=rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG,$({}));let mime="image/png";',
+    'if(out.length>900000){out=rep.representationUsingTypeProperties($.NSBitmapImageFileTypeJPEG,$({NSImageCompressionFactor:0.85}));mime="image/jpeg";}',
+    'JSON.stringify({mimeType:mime,data:ObjC.unwrap(out.base64EncodedStringWithOptions(0))});',
+  ].join("");
+  const raw = __bellExecFileSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", jxa], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 20_000,
+    env: {
+      PATH: "/usr/bin:/bin",
+      BELL_PDF_PATH: pdfPath,
+      BELL_PDF_PAGE: String(pageNum),
+      BELL_PDF_W: String(width),
+      BELL_PDF_H: String(height),
+      ...(password ? { BELL_PDF_PWD: password } : {}),
+    },
+  });
+  return JSON.parse(raw.trim());
+}
+`;
+            src = macPdfKitHelper + src
+              .replace(
+                'const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");',
+                '(globalThis as Record<string, unknown>).pdfjsWorker ||= await import("pdfjs-dist/legacy/build/pdf.worker.mjs");\n  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");',
+              )
+              .replace(
+                'new URL("../node_modules/pdfjs-dist/", import.meta.url)',
+                'new URL("../pdfjs-dist/", import.meta.url)',
+              )
+              .replace(
+                `const { canvas, context } = factory.create(width, height);
+        await page.render({ canvasContext: context as never, canvas: canvas as never, viewport }).promise;
+        let data = canvas.toBuffer("image/png"), mimeType = "image/png";
+        // Photos and scans compress poorly as PNG.
+        if (data.length > 900_000) { data = canvas.toBuffer("image/jpeg", 85); mimeType = "image/jpeg"; }
+        images.push({ page: number, mimeType, data: data.toString("base64"), width, height });`,
+                `try {
+          const { canvas, context } = factory.create(width, height);
+          await page.render({ canvasContext: context as never, canvas: canvas as never, viewport }).promise;
+          let data = canvas.toBuffer("image/png"), mimeType = "image/png";
+          if (data.length > 900_000) { data = canvas.toBuffer("image/jpeg", 85); mimeType = "image/jpeg"; }
+          images.push({ page: number, mimeType, data: data.toString("base64"), width, height });
+        } catch (canvasErr) {
+          if (process.platform === "darwin") {
+            const rendered = __bellRenderPdfPageDarwin(path, number, width, height, request.password);
+            images.push({ page: number, mimeType: rendered.mimeType, data: rendered.data, width, height });
+          } else {
+            throw canvasErr;
+          }
+        }`,
+              );
+          } else if (path.resolve(args.path) === documentsTsPath) {
+            // shortcut: Windows zero-node_modules bundle omits @napi-rs/canvas (~30 MB), fall back to extracted PDF text layer unless 100% scanned
             src = src.replace(
-              'new URL("../node_modules/pdfjs-dist/", import.meta.url)',
-              'new URL("../pdfjs-dist/", import.meta.url)',
+              `images = await this.renderer(join(this.directoryFor(id), "original.pdf"),
+          visual
+            ? { required: imageOnly, candidates: visual.map(item => item.page), limit: DOCUMENT_MAX_VISUAL_PAGES, ranked: true }
+            : { required: imageOnly, candidates: [...chosen].filter(page => !transcribed(page)), limit: DOCUMENT_MAX_VISUAL_PAGES },
+          signal, { password: options.password });`,
+              `images = await this.renderer(join(this.directoryFor(id), "original.pdf"),
+          visual
+            ? { required: imageOnly, candidates: visual.map(item => item.page), limit: DOCUMENT_MAX_VISUAL_PAGES, ranked: true }
+            : { required: imageOnly, candidates: [...chosen].filter(page => !transcribed(page)), limit: DOCUMENT_MAX_VISUAL_PAGES },
+          signal, { password: options.password }).catch(err => {
+            if (selected.blocks.length > 0 && err instanceof AppError && err.status === 422) {
+              notes.push("目前執行環境未載入頁面影像繪製元件，本次改依 PDF 文字層進行解說。");
+              return [];
+            }
+            throw err;
+          });`,
             );
           }
           return { contents: src, loader: "ts", resolveDir: path.dirname(args.path) };
@@ -469,6 +554,63 @@ function httpGet(port, urlPath, timeoutMs = 1500) {
   });
 }
 
+const SAMPLE_VERIFY_PDF = Buffer.from(`%PDF-1.4
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj
+4 0 obj << /Length 44 >> stream
+BT /F1 18 Tf 72 720 Td (Hello BELL Explain) Tj ET
+endstream endobj
+5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000229 00000 n 
+0000000322 00000 n 
+trailer << /Size 6 /Root 1 0 R >>
+startxref
+390
+%%EOF`, "utf8");
+
+function httpPostPdf(port, urlPath, pdfBytes, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const req = http.request(
+      {
+        method: "POST",
+        host: "127.0.0.1",
+        port,
+        path: urlPath,
+        headers: {
+          Host: `127.0.0.1:${port}`,
+          Origin: `http://127.0.0.1:${port}`,
+          "Content-Type": "application/octet-stream",
+          "Content-Length": String(pdfBytes.byteLength),
+          "X-Document-Name": encodeURIComponent("verify-sample.pdf"),
+          Accept: "application/json",
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (c) => {
+          if (body.length < 65536) body += c;
+        });
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+      },
+    );
+    req.on("error", () => resolve({ status: 0, body: "" }));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve({ status: 0, body: "" });
+    });
+    req.end(pdfBytes);
+  });
+}
+
 export async function verifySidecars() {
   const tmpRoot = mkdtempSync(path.join(os.tmpdir(), "bell-sidecar-verify-"));
   const children = [];
@@ -527,8 +669,20 @@ export async function verifySidecars() {
                 `[${spec.id}] static frontend / returned HTTP ${indexRes.status}`,
               );
             }
+            if (spec.id === "explain") {
+              const pdfRes = await httpPostPdf(spec.verifyPort, "/api/documents", SAMPLE_VERIFY_PDF);
+              if (pdfRes.status !== 201) {
+                throw new Error(
+                  `[explain] PDF upload/parse smoke check failed (HTTP ${pdfRes.status}): ${pdfRes.body}`,
+                );
+              }
+              const pdfDoc = JSON.parse(pdfRes.body);
+              if (pdfDoc.format !== "pdf" || Number(pdfDoc.extractedChars ?? 0) < 10) {
+                throw new Error(`[explain] Unexpected parsed PDF payload: ${pdfRes.body}`);
+              }
+            }
             console.log(
-              `  [PASS] ${spec.id.padEnd(9)} ${origin}/api/suite/manifest -> 200 (appId=${parsed.appId}, frontend=200)`,
+              `  [PASS] ${spec.id.padEnd(9)} ${origin}/api/suite/manifest -> 200 (appId=${parsed.appId}, frontend=200${spec.id === "explain" ? ", pdf=201" : ""})`,
             );
             return;
           }
